@@ -7,7 +7,12 @@ from scipy.sparse import csr_matrix
 
 import implicit.gpu
 from implicit.recommender_base import RecommenderBase
-from implicit.utils import _batch_call, _filter_items_from_results
+from implicit.utils import (
+    _batch_call,
+    _filter_items_from_results,
+    _get_exclude_items,
+    _recommend_with_expanding_search,
+)
 
 log = logging.getLogger("implicit")
 
@@ -193,9 +198,20 @@ class FaissModel(RecommenderBase):
         if items is not None and self.approximate_recommend:
             raise NotImplementedError("using a 'items' list with ANN search isn't supported")
 
-        # batch computation is tricky with filter_already_liked_items (requires querying a
-        # different number of rows per user). Instead just fallback to a faiss query per user
-        if filter_already_liked_items and not np.isscalar(userid):
+        # batch computation is tricky with an expanding per-user search (requires querying a
+        # different number of candidates per user). Instead just fallback to a faiss query per
+        # user - or handle it in a single faiss query when there's nothing to filter out.
+        if not np.isscalar(userid) and (filter_already_liked_items or filter_items is not None):
+            if user_items is None:
+                return self.model.recommend(
+                    userid,
+                    user_items,
+                    N=N,
+                    filter_already_liked_items=filter_already_liked_items,
+                    filter_items=filter_items,
+                    recalculate_user=recalculate_user,
+                    items=items,
+                )
             return _batch_call(
                 self.recommend,
                 userid,
@@ -229,23 +245,22 @@ class FaissModel(RecommenderBase):
             if implicit.gpu.HAS_CUDA and isinstance(user, implicit.gpu.Matrix):
                 user = user.to_numpy()
 
-        # calculate the top N items, removing the users own liked items from
-        # the results
-        count = N
-        if filter_items:
-            count += len(filter_items)
-            filter_items = np.array(filter_items)
+        if not np.isscalar(userid):
+            return self._recommend_batch(userid, user, N)
 
-        if filter_already_liked_items:
-            user_likes = user_items[0].indices
-            filter_items = (
-                np.append(filter_items, user_likes) if filter_items is not None else user_likes
-            )
-            count += len(user_likes)
+        # calculate the top N items, removing the users own liked items from the
+        # results, expanding the ANN search per-user until we have enough usable
+        # candidates (or hit the search upper bound) and filling any remaining
+        # shortfall with the exact factor scores.
+        exclude = _get_exclude_items(user_items, filter_items, filter_already_liked_items)
+        user = np.asarray(user, dtype="float32").reshape(-1)
+        num_items = self.model.item_factors.shape[0]
 
-        # the GPU variant of faiss doesn't support returning more than 1024 results.
-        # fall back to the exact match when this happens
-        if self.use_gpu and count >= 1024:
+        # the GPU variant of faiss doesn't support returning more than 1024 results,
+        # so cap the number of candidates we can ask it for - falling back to the exact
+        # recommend call entirely when even the initial request wouldn't fit
+        max_candidates = 1023 if self.use_gpu else None
+        if max_candidates is not None and N + len(exclude) > max_candidates:
             return self.model.recommend(
                 userid,
                 user_items,
@@ -256,19 +271,18 @@ class FaissModel(RecommenderBase):
                 items=items,
             )
 
-        if np.isscalar(userid):
-            query = user.reshape(1, -1).astype("float32")
-        else:
-            query = user.astype("float32")
+        def query_fn(count):
+            scores, ids = self.recommend_index.search(user.reshape(1, -1), count)
+            return ids[0], scores[0]
 
-        scores, ids = self.recommend_index.search(query, count)
+        return _recommend_with_expanding_search(
+            self.model, user, N, exclude, num_items, query_fn, max_candidates=max_candidates
+        )
 
-        if np.isscalar(userid):
-            ids, scores = ids[0], scores[0]
-
-        if filter_items is not None:
-            ids, scores = _filter_items_from_results(userid, ids, scores, filter_items, N)
-
+    def _recommend_batch(self, userid, user, N):
+        """Recommends for a batch of users in a single faiss query, without any filtering"""
+        query = np.asarray(user, dtype="float32")
+        scores, ids = self.recommend_index.search(query, N)
         return ids, scores
 
     def similar_users(self, userid, N=10, filter_users=None, users=None):

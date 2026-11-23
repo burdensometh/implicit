@@ -136,6 +136,186 @@ def _batch_call(func, ids, *args, N=10, id_dtype=np.int32, score_dtype=np.float3
     return output_ids, output_scores
 
 
+def _get_exclude_items(user_items, filter_items, filter_already_liked_items):
+    """Returns the item ids that should be filtered out of a recommend call.
+
+    This combines the explicit filter_items list with the items the user has already
+    liked (when filter_already_liked_items is set) into a single array.
+    """
+    exclude = None
+    if filter_items is not None:
+        exclude = np.asarray(filter_items, dtype=np.int64)
+    if filter_already_liked_items:
+        liked = user_items[0].indices
+        exclude = liked if exclude is None else np.concatenate([exclude, liked])
+    if exclude is None:
+        return np.empty(0, dtype=np.int64)
+    return exclude
+
+
+def _expand_candidate_ids(query_fn, N, exclude, num_items, max_candidates=None):
+    """Collects candidate item ids from an approximate index in expanding batches.
+
+    Filtering the results of an ANN lookup can leave too few candidates to fill the
+    requested number of recommendations - this happens for instance with users that have
+    already interacted with (or had filtered out) all of the top candidates returned by
+    the index. Rather than issuing a single oversized query, this queries the index in
+    batches, expanding the requested number of candidates each round and skipping both
+    the excluded items and any candidate that has already been seen, until N usable
+    candidates have been collected or the search upper bound has been reached.
+
+    Parameters
+    ----------
+    query_fn : Callable[[int], Tuple[array_like, array_like]]
+        Function that queries the index, returning up to count (item ids, scores).
+    N : int
+        The number of candidates to collect.
+    exclude : array_like or None
+        Item ids to exclude from the results.
+    num_items : int
+        The total number of items in the index.
+    max_candidates : int, optional
+        Upper bound on the number of candidates to retrieve from the index. Defaults to
+        the number of items in the index.
+
+    Returns
+    -------
+    numpy.ndarray
+        The collected item ids, in the order the index returned them. This may contain
+        fewer than N entries if the search upper bound was reached.
+    """
+    limit = num_items if max_candidates is None else min(num_items, int(max_candidates))
+    if limit <= 0 or N <= 0:
+        return np.empty(0, dtype=np.int64)
+
+    seen = set(np.asarray(exclude).tolist()) if exclude is not None else set()
+
+    collected = []
+    # start off with the same sized request as an unfiltered lookup: enough for the N
+    # results plus the items we need to skip over. Only expand from here if it isn't
+    # enough.
+    count = max(1, min(limit, N + len(seen)))
+    while True:
+        ids, _ = query_fn(count)
+        ids = np.asarray(ids)
+        for item in ids.tolist():
+            if item < 0 or item >= num_items or item in seen:
+                continue
+            seen.add(item)
+            collected.append(item)
+            if len(collected) >= N:
+                break
+
+        # some indexes (annoy/nmslib) return fewer than requested when they run out of
+        # items - there's no point in expanding the search in that case
+        exhausted = len(ids) < count
+        if len(collected) >= N or count >= limit or exhausted:
+            break
+
+        # expand the search: double the number of requested candidates, at least
+        # increasing it by N each round, up to the search upper bound
+        count = min(limit, max(count * 2, count + N))
+
+    return np.array(collected, dtype=np.int64)
+
+
+def _exact_inner_product_scores(model, user, item_ids):
+    """Scores the given items exactly against the user factors with a matrix factorization model.
+
+    This is used to fill in any recommendations that an approximate search couldn't find
+    enough candidates for, using the same inner product scoring that the exact recommend
+    call uses.
+    """
+    item_factors = model.item_factors
+    if _is_gpu_matrix(item_factors):
+        # index on the GPU first, so we only copy the selected rows back to the host
+        factors = item_factors[np.asarray(item_ids)].to_numpy()
+    else:
+        factors = item_factors[np.asarray(item_ids)]
+    factors = np.asarray(factors, dtype=np.float64)
+    user = np.asarray(user, dtype=np.float64).reshape(-1)
+    return factors.dot(user)
+
+
+def _is_gpu_matrix(factors):
+    """Returns True if the passed in factors are a GPU matrix rather than a numpy array"""
+    cls = type(factors)
+    return cls.__name__ == "Matrix" and cls.__module__.startswith("implicit.gpu")
+
+
+def _sort_by_score(ids, scores, N):
+    """Sorts ids by descending score, keeping the index order for tied scores"""
+    order = np.argsort(-np.asarray(scores), kind="stable")
+    return np.asarray(ids)[order][:N], np.asarray(scores)[order][:N]
+
+
+def _recommend_with_expanding_search(
+    model, user, N, exclude, num_items, query_fn, max_candidates=None
+):
+    """Recommends items for a single user with an approximate index and expanding search.
+
+    The top candidates returned by an approximate index are frequently all items the user
+    has already interacted with (or otherwise asked to filter out) for users with a long
+    history. This gathers candidates from the index in expanding batches, skipping seen
+    candidates, until enough usable items are collected or the search upper bound is hit.
+    If the index still can't supply N results the shortfall is filled in with the exact
+    inner product scoring over the remaining items. The final output is sorted by the
+    exact factor scores, keeping the index ordering for ties.
+
+    Parameters
+    ----------
+    model : MatrixFactorizationBase
+        The inner model providing the item factors used for exact scoring.
+    user : array_like
+        The user factor vector to score against.
+    N : int
+        The number of recommendations to return.
+    exclude : array_like or None
+        Item ids to exclude from the results.
+    num_items : int
+        The total number of items in the index.
+    query_fn : Callable[[int], Tuple[array_like, array_like]]
+        Function returning up to count (item ids, scores) from the approximate index.
+    max_candidates : int, optional
+        Upper bound on the number of candidates to retrieve from the index.
+
+    Returns
+    -------
+    tuple
+        Tuple of (itemids, scores) arrays.
+    """
+    if N <= 0:
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float64)
+
+    user = np.asarray(user).reshape(-1)
+    exclude_ids = np.asarray(exclude) if exclude is not None else np.empty(0, dtype=np.int64)
+
+    candidate_ids = _expand_candidate_ids(
+        query_fn, N, exclude_ids, num_items, max_candidates=max_candidates
+    )
+
+    # if we couldn't find enough candidates with the approximate index, fill in the
+    # shortfall with the exact factor scores over the items we haven't seen yet
+    if len(candidate_ids) < N:
+        mask = np.ones(num_items, dtype=bool)
+        mask[candidate_ids] = False
+        exclude_ids = exclude_ids[(exclude_ids >= 0) & (exclude_ids < num_items)]
+        if exclude_ids.size:
+            mask[exclude_ids] = False
+        remaining = np.nonzero(mask)[0]
+        if remaining.size:
+            remaining_scores = _exact_inner_product_scores(model, user, remaining)
+            order = np.argsort(-remaining_scores, kind="stable")
+            shortfall = N - len(candidate_ids)
+            candidate_ids = np.concatenate([candidate_ids, remaining[order][:shortfall]])
+
+    if not len(candidate_ids):
+        return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float64)
+
+    scores = _exact_inner_product_scores(model, user, candidate_ids)
+    return _sort_by_score(candidate_ids, scores, N)
+
+
 def _filter_items_from_results(queryid, ids, scores, filter_items, N):
     if np.isscalar(queryid):
         mask = np.isin(ids, filter_items, invert=True)

@@ -6,7 +6,13 @@ from scipy.sparse import csr_matrix
 
 import implicit.gpu
 from implicit.recommender_base import RecommenderBase
-from implicit.utils import _batch_call, _filter_items_from_results, augment_inner_product_matrix
+from implicit.utils import (
+    _batch_call,
+    _filter_items_from_results,
+    _get_exclude_items,
+    _recommend_with_expanding_search,
+    augment_inner_product_matrix,
+)
 
 log = logging.getLogger("implicit")
 
@@ -198,33 +204,20 @@ class AnnoyModel(RecommenderBase):
                 user = user.to_numpy()
 
         # calculate the top N items, removing the users own liked items from
-        # the results
-        count = N
-        if filter_items:
-            count += len(filter_items)
-            filter_items = np.array(filter_items)
-
-        if filter_already_liked_items:
-            user_likes = user_items[0].indices
-            filter_items = (
-                np.append(filter_items, user_likes) if filter_items is not None else user_likes
-            )
-            count += len(user_likes)
-
+        # the results, expanding the ANN search per-user until we have enough
+        # usable candidates (or hit the search upper bound) and filling any
+        # remaining shortfall with the exact factor scores.
+        exclude = _get_exclude_items(user_items, filter_items, filter_already_liked_items)
+        user = np.asarray(user).reshape(-1)
         query = np.append(user, 0)
-        ids, scores = self.recommend_index.get_nns_by_vector(
-            query, count, include_distances=True, search_k=self.search_k
-        )
-        ids, scores = np.array(ids), np.array(scores)
+        num_items = self.model.item_factors.shape[0]
 
-        if filter_items is not None:
-            ids, scores = _filter_items_from_results(userid, ids, scores, filter_items, N)
+        def query_fn(count):
+            return self.recommend_index.get_nns_by_vector(
+                query, count, include_distances=True, search_k=self.search_k
+            )
 
-        # convert the distances from euclidean to cosine distance,
-        # and then rescale the cosine distance to go back to inner product
-        scaling = self.max_norm * np.linalg.norm(query)
-        scores = scaling * (1 - (scores**2) / 2)
-        return ids, scores
+        return _recommend_with_expanding_search(self.model, user, N, exclude, num_items, query_fn)
 
     def similar_users(self, userid, N=10, filter_users=None, users=None):
         raise NotImplementedError(
