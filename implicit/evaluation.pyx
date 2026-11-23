@@ -473,3 +473,278 @@ def ranking_metrics_at_k(model, train_user_items, test_user_items, int K=10,
         "ndcg": ndcg / total,
         "auc": mean_auc / total
     }
+
+
+def item_groups_by_train_count(train_user_items, num_groups=None, thresholds=None):
+    """ Assigns items to popularity groups, using training interactions only.
+
+    Items are bucketed by the number of users that interacted with them in the
+    training matrix. Items that never appear in the training data (for instance
+    new items introduced by a validation/test split) are not bucketed at all:
+    they are assigned the dedicated group id ``-1`` ('unseen') and are excluded
+    from the boundary computation, so they can never distort the bucketing of
+    the training items.
+
+    Parameters
+    ----------
+    train_user_items : csr_matrix
+        Sparse matrix of user by item that contains the elements that were used
+        to train the model. This is the only input that determines the groups.
+    num_groups : int, optional
+        The number of popularity groups to create. Boundaries are placed on
+        quantiles of the positive train interaction counts, so that each group
+        holds a similar number of training items. Defaults to 3 (tail/torso/head)
+        when neither num_groups nor thresholds is given. Because interaction
+        counts are heavily tied on small datasets, the effective number of
+        non-empty groups can be smaller than requested.
+    thresholds : array_like of int, optional
+        Explicit interaction-count cut points. Each threshold ``t`` starts a new
+        group for items with count ``>= t``: with thresholds ``[t0, t1]`` the
+        groups are counts in ``[1, t0)``, ``[t0, t1)`` and ``[t1, inf)``.
+        Mutually exclusive with num_groups.
+
+    Returns
+    -------
+    (groups, labels) : (ndarray, list of str)
+        groups is an int32 array of shape (n_items,) with the group id of each
+        item, or -1 for items unseen in the training data. labels[g] is a
+        human-readable description of the count interval of group g.
+    """
+    if num_groups is not None and thresholds is not None:
+        raise ValueError("Only one of 'num_groups' and 'thresholds' can be set")
+    if num_groups is None and thresholds is None:
+        num_groups = 3
+
+    # popularity of each item = number of training interactions (train data only)
+    counts = np.asarray(train_user_items.getnnz(axis=0)).astype(np.int64)
+
+    if thresholds is not None:
+        thresholds = np.asarray(thresholds, dtype=np.float64)
+        if thresholds.ndim != 1 or not len(thresholds):
+            raise ValueError("thresholds must be a non-empty 1-d array of cut points")
+        if np.any(thresholds < 1):
+            raise ValueError("thresholds must be >= 1")
+        # counts are integral: ceiling keeps the partition identical while
+        # giving exact integer boundaries
+        boundaries = np.unique(np.ceil(thresholds).astype(np.int64))
+    else:
+        if num_groups < 1:
+            raise ValueError("num_groups must be >= 1")
+        num_groups = int(num_groups)
+        positive = counts[counts > 0]
+        if len(positive):
+            quantiles = np.linspace(0.0, 1.0, num_groups + 1)[1:-1]
+            boundaries = np.unique(np.ceil(np.quantile(positive, quantiles)).astype(np.int64))
+        else:
+            boundaries = np.empty(0, dtype=np.int64)
+
+    groups = np.searchsorted(boundaries, counts, side="right").astype(np.int32)
+    groups[counts == 0] = -1
+
+    labels = []
+    lo = 1
+    for boundary in boundaries:
+        labels.append(f"[{lo}, {boundary})")
+        lo = int(boundary)
+    labels.append(f"[{lo}, inf)")
+
+    return groups, labels
+
+
+@cython.boundscheck(False)
+def ranking_metrics_at_k_by_item_group(model, train_user_items, test_user_items, int K=10,
+                                       num_groups=None, thresholds=None,
+                                       show_progress=True, int num_threads=1):
+    """ Calculates the hit rate (precision@K) broken down by item popularity group.
+
+    Reporting only the overall hit rate can hide regressions on long-tail items:
+    popular items dominate the average, so a drop on rarely interacted items -
+    and on the small-shop users who depend on them - goes unnoticed. This
+    function buckets items by their number of *training* interactions (see
+    item_groups_by_train_count) and reports the hit rate of each group
+    separately, next to the overall figure.
+
+    All groups are evaluated on the same candidate users (users with at least
+    one item in the test set) and the same ground-truth labels
+    (test_user_items) as ranking_metrics_at_k, so the group results are
+    directly comparable to the overall numbers: the overall precision reported
+    here equals ranking_metrics_at_k(...)['precision'], and the per-group
+    'relevant' counts sum up to the overall one.
+
+    The grouping is determined by the training matrix only. Items that never
+    appear in the training data (e.g. new items introduced by the
+    validation/test split) are placed in a dedicated 'unseen' group and never
+    influence the bucket boundaries of the training items.
+
+    Parameters
+    ----------
+    model : RecommenderBase
+        The fitted recommendation model to test
+    train_user_items : csr_matrix
+        Sparse matrix of user by item that contains elements that were used
+            in training the model. Also the only input used to bucket items.
+    test_user_items : csr_matrix
+        Sparse matrix of user by item that contains withheld elements to
+        test on
+    K : int
+        Number of items to test on
+    num_groups : int, optional
+        Number of popularity groups to bucket training items into (quantile
+        boundaries). Defaults to 3. Mutually exclusive with thresholds.
+    thresholds : array_like of int, optional
+        Explicit interaction-count cut points for the groups, see
+        item_groups_by_train_count. Mutually exclusive with num_groups.
+    show_progress : bool, optional
+        Whether to show a progress bar
+    num_threads : int, optional
+        The number of threads to use for testing. Specifying 0 means to default
+        to the number of cores on the machine. Note: aside from the ALS and BPR
+        models, setting this to more than 1 will likely hurt performance rather
+        than help.
+
+    Returns
+    -------
+    dict
+        A dict with keys:
+
+        - 'overall': dict with the metrics over all candidate users:
+          'precision' (identical to ranking_metrics_at_k), 'relevant' (total
+          hits in the top-K), 'effective_denominator' (sum over users of
+          min(K, #test items of the user)), 'num_users' and 'empty'.
+        - 'groups': list of per-group dicts, one per popularity bucket ordered
+          by increasing train interaction count, plus a final group
+          'unseen' holding items without any training interaction. Each entry
+          has: 'group', 'label', 'precision' (None when the group is empty),
+          'relevant' (hits in the top-K on items of this group),
+          'effective_denominator' (sum over candidate users of
+          min(K, #test items of the user in this group)), 'test_items' (total
+          test labels in the group), 'num_users' (candidate users with at
+          least one test label in the group), 'num_items' (training items
+          assigned to the group) and 'empty' (True when no test label falls
+          in the group, in which case 'precision' is None).
+        - 'K': the value of K the metrics were computed at.
+    """
+    if K < 1:
+        raise ValueError("K must be >= 1")
+    if not isinstance(train_user_items, csr_matrix):
+        train_user_items = train_user_items.tocsr()
+
+    if not isinstance(test_user_items, csr_matrix):
+        test_user_items = test_user_items.tocsr()
+
+    # bucket items by training popularity; this only ever looks at the
+    # training matrix, so validation-only items can't distort the bucketing
+    item_groups, labels = item_groups_by_train_count(
+        train_user_items, num_groups=num_groups, thresholds=thresholds)
+
+    cdef int users = test_user_items.shape[0]
+    cdef int items = max(train_user_items.shape[1], test_user_items.shape[1])
+    cdef int n_bucketed = len(labels)
+    cdef int unseen = n_bucketed  # index of the 'unseen' group
+    cdef int G = n_bucketed + 1
+
+    # items that only exist in the test matrix are 'unseen' as well
+    if item_groups.shape[0] < items:
+        item_groups = np.concatenate(
+            [item_groups, np.full(items - item_groups.shape[0], -1, dtype=np.int32)])
+    cdef int[:] item_group = item_groups
+
+    cdef int u, i, g, batch_idx
+    # per-group accumulators
+    cdef double[:] relevant = np.zeros(G)
+    cdef double[:] pr_div = np.zeros(G)
+    cdef double[:] group_test_items = np.zeros(G)
+    cdef double[:] group_users = np.zeros(G)
+    # per-user scratch: number of test items of the user in each group
+    cdef int[:] likes_in_group = np.zeros(G, dtype=np.int32)
+    # overall accumulators
+    cdef double total = 0, overall_pr_div = 0
+
+    cdef int[:] test_indptr = test_user_items.indptr
+    cdef int[:] test_indices = test_user_items.indices
+
+    cdef int[:, :] ids
+    cdef int[:] batch
+
+    cdef unordered_set[int] likes
+
+    batch_size = 1000
+    start_idx = 0
+
+    # get an array of userids that have at least one item in the test set
+    to_generate = np.arange(users, dtype="int32")
+    to_generate = to_generate[np.ediff1d(test_user_items.indptr) > 0]
+
+    progress = tqdm(total=len(to_generate), disable=not show_progress)
+
+    while start_idx < len(to_generate):
+        batch = to_generate[start_idx: start_idx + batch_size]
+        ids, _ = model.recommend(batch, train_user_items[np.asarray(batch)], N=K)
+        start_idx += batch_size
+
+        with nogil:
+            for batch_idx in range(len(batch)):
+                u = batch[batch_idx]
+                likes.clear()
+                for g in range(G):
+                    likes_in_group[g] = 0
+                for i in range(test_indptr[u], test_indptr[u+1]):
+                    likes.insert(test_indices[i])
+                    g = item_group[test_indices[i]]
+                    if g < 0:
+                        g = unseen
+                    likes_in_group[g] += 1
+
+                overall_pr_div += fmin(K, likes.size())
+                for g in range(G):
+                    if likes_in_group[g] > 0:
+                        pr_div[g] += fmin(K, likes_in_group[g])
+                        group_users[g] += 1
+                        group_test_items[g] += likes_in_group[g]
+
+                for i in range(K):
+                    # only count hits: a recommended id found in 'likes' is a
+                    # valid test item, so the group lookup is always in bounds
+                    if likes.find(ids[batch_idx, i]) != likes.end():
+                        g = item_group[ids[batch_idx, i]]
+                        if g < 0:
+                            g = unseen
+                        relevant[g] += 1
+                total += 1
+
+        progress.update(len(batch))
+
+    progress.close()
+
+    item_groups = np.asarray(item_group)
+    num_items = np.bincount(np.where(item_groups < 0, unseen, item_groups), minlength=G)
+
+    groups = []
+    for g in range(G):
+        groups.append({
+            "group": g if g < n_bucketed else "unseen",
+            "label": labels[g] if g < n_bucketed else "unseen (no train interactions)",
+            "precision": relevant[g] / pr_div[g] if pr_div[g] > 0 else None,
+            "relevant": int(relevant[g]),
+            "effective_denominator": int(pr_div[g]),
+            "test_items": int(group_test_items[g]),
+            "num_users": int(group_users[g]),
+            "num_items": int(num_items[g]),
+            "empty": pr_div[g] == 0,
+        })
+
+    relevant_total = 0.0
+    for g in range(G):
+        relevant_total += relevant[g]
+
+    return {
+        "K": K,
+        "overall": {
+            "precision": relevant_total / overall_pr_div if overall_pr_div > 0 else None,
+            "relevant": int(relevant_total),
+            "effective_denominator": int(overall_pr_div),
+            "num_users": int(total),
+            "empty": total == 0,
+        },
+        "groups": groups,
+    }
