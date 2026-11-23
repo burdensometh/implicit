@@ -70,6 +70,44 @@ last.fm dataset](https://github.com/benfred/implicit/blob/master/examples/lastfm
 
 For more information see the [documentation](https://benfred.github.io/implicit/).
 
+#### Building a feedback matrix from events
+
+Raw event streams (page views, carts, purchases, rejections) need to be converted into the
+`(users, items)` confidence matrix the models are trained on. `implicit.feedback` implements a
+reproducible event-to-feedback path: events are deduplicated by event id (so receiver replays and
+at-least-once deliveries collapse), conflicting duplicates are resolved by an explicit policy,
+each event is weighted by behaviour type and decayed by its age against a training cutoff, and
+positive/negative evidence for the same user/item pair is combined with a configurable
+cancellation rule before the matrix is handed to `fit`.
+
+```python
+from datetime import datetime, timedelta
+import implicit
+from implicit.feedback import FeedbackConfig, build_feedback_matrix
+
+config = FeedbackConfig(
+    training_cutoff=datetime(2024, 6, 1),
+    event_weights={"view": 1.0, "cart": 3.0, "purchase": 5.0, "reject": -6.0},
+    half_life={"view": timedelta(days=2), "cart": timedelta(days=7),
+               "purchase": timedelta(days=90), "reject": timedelta(days=90)},
+    cancellation_policy="net",
+)
+
+feedback = build_feedback_matrix(events, config)  # events: list of dicts or column arrays
+model = implicit.als.AlternatingLeastSquares(factors=50)
+feedback.fit(model)                               # trains ALS on the generated matrix
+
+# map model indices back to the original ids
+row = feedback.user_index["alice"]
+items = feedback.item_ids
+```
+
+The resulting matrix is deterministic for a given event set, independent of input order. Set
+`cancellation_policy="rejection_wins"` if a purchase followed by a return should always be a
+negative, or `"latest_wins"` if the most recent event should decide the sign. Events after the
+training cutoff are dropped by default to avoid leaking future information; see the API docs for
+the full set of options.
+
 #### Articles about Implicit
 
 These blog posts describe the algorithms that power this library:
