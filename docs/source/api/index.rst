@@ -7,3 +7,4 @@ API Reference
    Models <models/index>
    Evaluation <evaluation>
    Approximate Nearest Neighbours <ann>
+   Session Co-occurrence <sessions>

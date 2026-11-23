@@ -1,3 +1,12 @@
+## Unreleased
+
+### New Features
+
+* Add `implicit.sessions` for building item-item similarity input from time-segmented sessions:
+  events are split on member idle time, duplicate item views within a session are merged, and
+  items from different sessions never co-occur. `ItemItemRecommender.fit_sessions` trains the
+  existing Cosine/TF-IDF/BM25 similarity path directly from timestamped events.
+
 ## v0.5.0
 
 ### Breaking API Changes

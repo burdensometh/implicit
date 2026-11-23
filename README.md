@@ -68,6 +68,27 @@ related = model.similar_items(itemid)
 The examples folder has a program showing how to use this to [compute similar artists on the
 last.fm dataset](https://github.com/benfred/implicit/blob/master/examples/lastfm.py).
 
+#### Session Based Similarity
+
+When the input is a log of timestamped browsing events rather than a user-item matrix, feeding
+all of a member's events in as one row conflates unrelated visits: items browsed weeks apart
+become "similar". Use `fit_sessions` to build the similarity input from sessions instead - events
+are split whenever the member is idle longer than `idle_timeout`, duplicate views within a session
+are merged, and items from different sessions never co-occur:
+
+```python
+import implicit
+
+model = implicit.nearest_neighbours.TFIDFRecommender()
+model.fit_sessions(events, idle_timeout=30 * 60)  # events: (user, item, timestamp) records
+related = model.similar_items(itemid)             # itemid indexes the item columns
+```
+
+Pass `item_ids=[...]` to fix the column order when your item ids are not contiguous integers;
+`build_session_matrix(..., return_item_ids=True)` returns the label-to-column mapping. See the
+[session co-occurrence documentation](https://benfred.github.io/implicit/api/sessions.html) for
+the accepted event formats and the lower level `implicit.sessions` helpers.
+
 For more information see the [documentation](https://benfred.github.io/implicit/).
 
 #### Articles about Implicit

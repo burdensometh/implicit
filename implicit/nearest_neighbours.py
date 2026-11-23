@@ -4,6 +4,12 @@ from scipy.sparse import coo_matrix, csr_matrix
 
 from ._nearest_neighbours import NearestNeighboursScorer, all_pairs_knn
 from .recommender_base import RecommenderBase
+from .sessions import (
+    DEFAULT_IDLE_TIMEOUT,
+    build_session_matrix,
+    cooccurrence_counts,
+    split_sessions,
+)
 from .utils import _batch_call
 
 
@@ -28,7 +34,13 @@ class ItemItemRecommender(RecommenderBase):
         self.scorer = None
 
     def fit(self, weighted, show_progress=True, callback=None):
-        """Computes and stores the similarity matrix"""
+        """Computes and stores the similarity matrix.
+
+        ``weighted`` is a sparse ``(groups x items)`` matrix whose rows are the baskets of items
+        that should be considered together.  To derive those rows from timestamped events by
+        session instead of treating every user as one basket, use :meth:`fit_sessions` (or pass
+        a matrix built by :func:`implicit.sessions.build_session_matrix`).
+        """
         if callback:
             raise NotImplementedError("callback isn't support on ItemItemRecommender.fit")
 
@@ -39,6 +51,122 @@ class ItemItemRecommender(RecommenderBase):
             num_threads=self.num_threads,
         ).tocsr()
         self.scorer = NearestNeighboursScorer(self.similarity)
+
+    def fit_sessions(
+        self,
+        events,
+        idle_timeout=DEFAULT_IDLE_TIMEOUT,
+        columns=None,
+        item_ids=None,
+        num_items=None,
+        duplicate="binary",
+        min_session_items=1,
+        show_progress=True,
+        callback=None,
+    ):
+        """Fits the model on sessionized events instead of a user-item matrix.
+
+        Rather than treating every event of a user as one basket, the events are grouped into
+        sessions by splitting on inactivity gaps of more than ``idle_timeout`` seconds, and
+        repeated events for the same item within a session are merged.  The resulting
+        ``(sessions x items)`` matrix is fed through the normal :meth:`fit` path for the model,
+        so item similarity comes only from items browsed within the same session.  Two items
+        that the same member browsed in different sessions do not co-occur.
+
+        Parameters
+        ----------
+        events : iterable of (user, item, timestamp), numpy.ndarray or pandas.DataFrame
+            Timestamped events.  See :mod:`implicit.sessions` for accepted formats.
+        idle_timeout : float, optional
+            Idle time in seconds used to split sessions.  Defaults to 30 minutes.
+        columns : tuple of str, optional
+            Column names to use when ``events`` is a DataFrame.
+        item_ids : sequence, optional
+            Complete set of item labels, fixing the item dimension of the model.
+        num_items : int, optional
+            Number of item columns to use.  Inferred from the events when omitted.
+        duplicate : {"binary", "sum"}, optional
+            How to merge repeated item views inside a session.  Either way duplicate events are
+            merged into a single entry; the value is 1 per session for ``"binary"`` (default) or
+            the number of views for ``"sum"``.
+        min_session_items : int, optional
+            Drop sessions with fewer than this many distinct items.  Defaults to 1.
+        show_progress : bool, optional
+            Show a progress bar while computing the similarity matrix.
+        callback : callable, optional
+            Not supported by item-item recommenders.
+
+        Returns
+        -------
+        self
+        """
+        session_items = build_session_matrix(
+            events,
+            idle_timeout=idle_timeout,
+            columns=columns,
+            item_ids=item_ids,
+            num_items=num_items,
+            duplicate=duplicate,
+            min_session_items=min_session_items,
+        )
+        self.fit(session_items, show_progress=show_progress, callback=callback)
+        return self
+
+    def session_matrix(
+        self,
+        events,
+        idle_timeout=DEFAULT_IDLE_TIMEOUT,
+        columns=None,
+        item_ids=None,
+        num_items=None,
+        duplicate="binary",
+        min_session_items=1,
+        return_item_ids=False,
+    ):
+        """Builds the session-item matrix that :meth:`fit_sessions` would train on.
+
+        Useful for inspecting the input, or for using the session splitting without fitting a
+        model.  See :func:`implicit.sessions.build_session_matrix` for the parameters.
+        """
+        return build_session_matrix(
+            events,
+            idle_timeout=idle_timeout,
+            columns=columns,
+            item_ids=item_ids,
+            num_items=num_items,
+            duplicate=duplicate,
+            min_session_items=min_session_items,
+            return_item_ids=return_item_ids,
+        )
+
+    def split_sessions(self, events, idle_timeout=DEFAULT_IDLE_TIMEOUT, columns=None):
+        """Splits ``events`` into sessions without building a matrix.
+
+        See :func:`implicit.sessions.split_sessions`.
+        """
+        return split_sessions(events, idle_timeout=idle_timeout, columns=columns)
+
+    def session_cooccurrence(
+        self,
+        events,
+        idle_timeout=DEFAULT_IDLE_TIMEOUT,
+        columns=None,
+        item_ids=None,
+        num_items=None,
+        min_session_items=1,
+    ):
+        """Returns in-session item-item co-occurrence counts for ``events``.
+
+        See :func:`implicit.sessions.cooccurrence_counts`.
+        """
+        return cooccurrence_counts(
+            events,
+            idle_timeout=idle_timeout,
+            columns=columns,
+            item_ids=item_ids,
+            num_items=num_items,
+            min_session_items=min_session_items,
+        )
 
     def recommend(
         self,
