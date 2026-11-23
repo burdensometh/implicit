@@ -405,6 +405,131 @@ class RecommenderBaseTestMixin:
             current_ids = ids[userid]
             self.assertEqual(set(current_ids), set(selected_items))
 
+    def test_recommend_per_user_items(self):
+        item_users = get_checker_board(50)
+        user_items = item_users.T.tocsr()
+
+        model = self._get_model()
+        model.fit(item_users, show_progress=False)
+
+        userids = np.array([0, 1, 2])
+        items = [[0, 2, 4, 6], [1, 3, 5], [2, 4, 6, 8, 10]]
+        try:
+            ids, scores = model.recommend(userids, user_items[userids], N=10, items=items)
+        except NotImplementedError:
+            # per-user items aren't supported by ANN models
+            return
+
+        # already liked items are filtered out of each users candidate set:
+        # user 0 has liked 2,4,6 / user 1 has liked 3,5 / user 2 has liked 4,6,8,10
+        self.assertEqual(len(ids), len(userids))
+        self.assertEqual(len(scores), len(userids))
+        for i, expected in enumerate([{0}, {1}, {2}]):
+            self.assertEqual(set(ids[i]), expected)
+            self.assertEqual(len(ids[i]), len(scores[i]))
+
+        # results come back in the same order as the userids passed in
+        shuffled_userids = np.array([2, 0, 1])
+        shuffled_items = [[2, 4], [0, 2], [1, 3]]
+        ids, _ = model.recommend(
+            shuffled_userids, user_items[shuffled_userids], N=10, items=shuffled_items
+        )
+        for i, expected in enumerate([{2}, {0}, {1}]):
+            self.assertEqual(set(ids[i]), expected)
+
+        # a 2D array of per-user candidates should also work
+        ids, _ = model.recommend(
+            userids, user_items[userids], N=5, items=np.array([[0, 2], [1, 3], [2, 4]])
+        )
+        for i, expected in enumerate([{0}, {1}, {2}]):
+            self.assertEqual(set(ids[i]), expected)
+
+        # filter_items removes items from each users candidate set, and can
+        # leave users with no candidates at all
+        ids, scores = model.recommend(
+            userids, user_items[userids], N=10, items=items, filter_items=[0, 1]
+        )
+        self.assertEqual(len(ids[0]), 0)
+        self.assertEqual(len(ids[1]), 0)
+        self.assertEqual(set(ids[2]), {2})
+
+        # empty candidate sets return empty results, rather than falling back
+        # to recommending from the entire catalogue
+        ids, scores = model.recommend(userids, user_items[userids], N=10, items=[[], [], []])
+        for i in range(len(userids)):
+            self.assertEqual(len(ids[i]), 0)
+            self.assertEqual(len(scores[i]), 0)
+
+        # candidate sets with fewer than N valid items aren't padded out to N
+        ids, scores = model.recommend(
+            userids,
+            user_items[userids],
+            N=10,
+            items=[[4], [5, 7], []],
+            filter_already_liked_items=False,
+        )
+        self.assertEqual(set(ids[0]), {4})
+        self.assertEqual(set(ids[1]), {5, 7})
+        self.assertEqual(len(ids[2]), 0)
+        for i in range(len(userids)):
+            self.assertTrue(np.all(np.asarray(ids[i]) >= 0))
+            self.assertTrue(np.all(np.diff(scores[i]) <= 0))
+
+        # a single user can also get recommendations from their own candidate set
+        ids, scores = model.recommend(0, user_items[0], N=10, items=[[0, 2, 4, 6]])
+        self.assertEqual(set(ids), {0})
+
+        # batch and scalar calls should agree with each other
+        batch_ids, batch_scores = model.recommend(
+            userids, user_items[userids], N=3, items=items, filter_already_liked_items=False
+        )
+        for i, userid in enumerate(userids):
+            ids, scores = model.recommend(
+                userid, user_items[userid], N=3, items=[items[i]], filter_already_liked_items=False
+            )
+            assert_array_equal(batch_ids[i], ids)
+            assert_array_equal(batch_scores[i], scores)
+
+        # invalid itemids in the candidate sets should raise an IndexError
+        with self.assertRaises(IndexError):
+            model.recommend(userids, user_items[userids], items=[[0], [1], [50]])
+        with self.assertRaises(IndexError):
+            model.recommend(userids, user_items[userids], items=[[0], [1], [-1]])
+
+        # passing the wrong number of per-user candidate sets should raise a ValueError
+        with self.assertRaises(ValueError):
+            model.recommend(userids, user_items[userids], items=[[0], [1]])
+        with self.assertRaises(ValueError):
+            model.recommend(userids, user_items[userids], items=np.array([[0], [1]]))
+
+    def test_recommend_items_with_filter_items(self):
+        item_users = get_checker_board(50)
+        user_items = item_users.T.tocsr()
+
+        model = self._get_model()
+        model.fit(item_users, show_progress=False)
+
+        try:
+            # shared candidate sets can be combined with filter_items
+            ids, _ = model.recommend(
+                0, user_items[0], N=10, items=[0, 2, 4], filter_items=[0],
+                filter_already_liked_items=False,
+            )
+        except NotImplementedError:
+            # items aren't supported by ANN models
+            return
+        self.assertEqual(set(ids), {2, 4})
+
+        # an empty shared candidate set returns empty results, rather than
+        # falling back to the entire catalogue
+        ids, scores = model.recommend(0, user_items[0], N=10, items=[])
+        self.assertEqual(len(ids), 0)
+        self.assertEqual(len(scores), 0)
+
+        ids, scores = model.recommend(np.arange(3), user_items[np.arange(3)], N=10, items=[])
+        self.assertEqual(ids.shape, (3, 0))
+        self.assertEqual(scores.shape, (3, 0))
+
     def test_pickle(self):
         user_items = get_checker_board(50)
         model = self._get_model()

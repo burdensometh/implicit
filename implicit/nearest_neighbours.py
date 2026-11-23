@@ -4,7 +4,7 @@ from scipy.sparse import coo_matrix, csr_matrix
 
 from ._nearest_neighbours import NearestNeighboursScorer, all_pairs_knn
 from .recommender_base import RecommenderBase
-from .utils import _batch_call
+from .utils import _batch_call, _check_items
 
 
 class ItemItemRecommender(RecommenderBase):
@@ -53,8 +53,39 @@ class ItemItemRecommender(RecommenderBase):
         if not isinstance(user_items, csr_matrix):
             raise ValueError("user_items needs to be a CSR sparse matrix")
 
+        user_count = 1 if np.isscalar(userid) else len(userid)
+
+        if items is not None:
+            items, per_user = _check_items(items, user_count, self.similarity.shape[0])
+
+            # remove any explicitly filtered out items from the candidate sets
+            if filter_items is not None:
+                if per_user:
+                    items = [np.setdiff1d(candidates, filter_items) for candidates in items]
+                else:
+                    items = np.setdiff1d(items, filter_items)
+                filter_items = None
+
+            # each user has their own candidate set: rank each set separately and
+            # return ragged lists of ids/scores, one per user
+            if per_user:
+                if user_items.shape[0] != user_count:
+                    raise ValueError("user_items must contain 1 row for every user in userids")
+                return self._recommend_per_user_items(
+                    userid, user_items, items, N, filter_already_liked_items, recalculate_user
+                )
+
+            if len(items) == 0:
+                # an empty candidate set means empty results: don't fall back
+                # to scoring every item in the model
+                ids = np.zeros((user_count, 0), dtype=np.int32)
+                scores = np.zeros((user_count, 0), dtype=np.float64)
+                if np.isscalar(userid):
+                    ids, scores = ids[0], scores[0]
+                return ids, scores
+
         if not np.isscalar(userid):
-            if user_items.shape[0] != len(userid):
+            if user_items.shape[0] != user_count:
                 raise ValueError("user_items must contain 1 row for every user in userids")
 
             return _batch_call(
@@ -69,17 +100,10 @@ class ItemItemRecommender(RecommenderBase):
                 items=items,
             )
 
-        if filter_items is not None and items is not None:
-            raise ValueError("Can't specify both filter_items and items")
-
         if filter_items is not None:
             N += len(filter_items)
         elif items is not None:
-            items = np.array(items)
             N = self.similarity.shape[0]
-            # check if items contains itemids that are not in the model(user_items)
-            if items.max() >= N or items.min() < 0:
-                raise IndexError("Some of selected itemids are not in the model")
 
         ids, scores = self.scorer.recommend(
             user_items.indptr,
@@ -104,6 +128,53 @@ class ItemItemRecommender(RecommenderBase):
                 scores = np.append(scores, np.full(missing.size, -np.finfo(scores.dtype).max))
 
         return ids, scores
+
+    def _recommend_per_user_items(
+        self, userid, user_items, items, N, filter_already_liked_items, recalculate_user
+    ):
+        """Ranks a different candidate set of items for each user.
+
+        Returns a tuple of (ids, scores) lists, with one array per user. Each user
+        gets at most N results: users with fewer valid candidates (after removing
+        already liked items) get correspondingly shorter arrays, and users with no
+        valid candidates get empty arrays.
+        """
+        userids = [userid] if np.isscalar(userid) else userid
+
+        all_ids, all_scores = [], []
+        for i, uid in enumerate(userids):
+            candidates = items[i]
+
+            # remove items the user has already liked from their candidate set
+            if filter_already_liked_items:
+                liked = user_items.indices[user_items.indptr[i] : user_items.indptr[i + 1]]
+                if len(liked):
+                    candidates = np.setdiff1d(candidates, liked)
+
+            if len(candidates) == 0:
+                all_ids.append(np.array([], dtype=np.int32))
+                all_scores.append(np.array([], dtype=np.float64))
+                continue
+
+            ids, scores = self.recommend(
+                uid,
+                user_items[i],
+                N=N,
+                filter_already_liked_items=False,
+                recalculate_user=recalculate_user,
+                items=candidates,
+            )
+
+            # the scalar call returns the whole candidate set, padding items it
+            # couldn't score with a placeholder score: remove those so that only
+            # real results remain, and limit to the top N
+            scored = scores > -np.finfo(scores.dtype).max
+            all_ids.append(ids[scored][:N])
+            all_scores.append(scores[scored][:N])
+
+        if np.isscalar(userid):
+            return all_ids[0], all_scores[0]
+        return all_ids, all_scores
 
     def similar_users(self, userid, N=10, filter_users=None, users=None):
         raise NotImplementedError("similar_users isn't implemented for item-item recommenders")

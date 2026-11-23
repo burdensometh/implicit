@@ -136,6 +136,57 @@ def _batch_call(func, ids, *args, N=10, id_dtype=np.int32, score_dtype=np.float3
     return output_ids, output_scores
 
 
+def _check_items(items, user_count, num_items):
+    """Validates and normalizes the 'items' parameter to recommend.
+
+    Returns a tuple of (items, is_per_user). When 'items' is a single candidate
+    set shared by all users (a 1D array of itemids), returns a sorted 1D ndarray
+    and False. When 'items' contains a candidate set per user (a 2D array with a
+    row for each user, or a ragged sequence of sequences), returns a list of
+    sorted unique 1D ndarrays - one for each user - and True.
+
+    Raises an IndexError if any itemid is not in the model, and a ValueError if
+    the shape of the items parameter doesn't match the number of users.
+    """
+
+    def check_bounds(itemids):
+        if itemids.size and (itemids.max() >= num_items or itemids.min() < 0):
+            raise IndexError("Some itemids in the items parameter are not in the model")
+
+    def check_user_items(row):
+        itemids = np.unique(np.asarray(row))
+        check_bounds(itemids)
+        return itemids
+
+    if isinstance(items, np.ndarray):
+        if items.ndim == 1:
+            items = np.array(items)
+            items.sort()
+            check_bounds(items)
+            return items, False
+        if items.ndim == 2:
+            if items.shape[0] != user_count:
+                raise ValueError("items must contain 1 row for every user in userids")
+            return [check_user_items(row) for row in items], True
+        raise ValueError("items must be a 1D or 2D array of itemids")
+
+    # handle array-like input, including ragged lists of per-user candidate sets
+    if not isinstance(items, (list, tuple)):
+        items = list(items)
+    is_per_user = any(isinstance(row, (list, tuple, np.ndarray)) for row in items)
+    if is_per_user:
+        if not all(isinstance(row, (list, tuple, np.ndarray)) for row in items):
+            raise ValueError("items must be a 1D or 2D array of itemids")
+        if len(items) != user_count:
+            raise ValueError("items must contain 1 row for every user in userids")
+        return [check_user_items(row) for row in items], True
+
+    items = np.array(items)
+    items.sort()
+    check_bounds(items)
+    return items, False
+
+
 def _filter_items_from_results(queryid, ids, scores, filter_items, N):
     if np.isscalar(queryid):
         mask = np.isin(ids, filter_items, invert=True)

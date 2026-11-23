@@ -53,7 +53,8 @@ class RecommenderBase(metaclass=ABCMeta):
         filter_already_liked_items parameter, as well as pass in filter_items to filter
         out other items for all users in the batch. By default all items in the training
         dataset are scored, but by setting the 'items' parameter you can restrict down to
-        a subset.
+        a subset. The 'items' parameter can either be a single candidate set shared by
+        all users, or a different candidate set for each user in the batch.
 
         Example usage::
 
@@ -63,6 +64,11 @@ class RecommenderBase(metaclass=ABCMeta):
             # calculate the top recommendations for a batch of users
             userids = np.arange(10)
             ids, scores = model.recommend(userids, user_items[userids])
+
+            # calculate the top recommendations for a batch of users, where each
+            # user has their own set of candidate items to rank
+            items = [[0, 1, 2], [3, 4], [5, 6, 7, 8], ...]
+            ids, scores = model.recommend(userids, user_items[userids], items=items)
 
         Parameters
         ----------
@@ -81,21 +87,29 @@ class RecommenderBase(metaclass=ABCMeta):
             When true, don't return items present in the training set that were rated
             by the specified user.
         filter_items : array_like, optional
-            List of extra item ids to filter out from the output
+            List of extra item ids to filter out from the output. When the 'items'
+            parameter is also set, these item ids are removed from the candidate sets
+            before ranking.
         recalculate_user : bool, optional
             When true, don't rely on stored user embeddings and instead recalculate from the
             passed in user_items. This option isn't supported by all models.
         items: array_like, optional
-            Array of extra item ids. When set this will only rank the items in this array instead
-            of ranking every item the model was fit for. This parameter cannot be used with
-            filter_items
+            Array of item ids. When set this will only rank the items in this array instead
+            of ranking every item the model was fit for. For batch recommendation this can
+            also be a 2D array (or a list of lists) with one row per user, giving each user
+            their own candidate set: in that case the returned ids and scores are lists of
+            arrays, one per user and in the same order as the userids passed in, with each
+            user getting up to N results. Users with fewer valid candidates - after removing
+            filtered out and already liked items - get correspondingly fewer results, and
+            users with an empty candidate set get empty results.
 
         Returns
         -------
         tuple
             Tuple of (itemids, scores) arrays. When calculating for a single user these array will
             be 1-dimensional with N items. When passed an array of userids, these will be
-            2-dimensional arrays with a row for each user.
+            2-dimensional arrays with a row for each user - unless a per-user 'items' parameter
+            was used, in which case they will be lists of 1-dimensional arrays, one for each user.
         """
 
     @abstractmethod

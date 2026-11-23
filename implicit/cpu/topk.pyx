@@ -20,6 +20,10 @@ def topk(items, query, int k, item_norms=None, filter_query_items=None, filter_i
     indices = np.zeros((query_rows, k), dtype="int32")
     distances = np.zeros((query_rows, k), dtype=query.dtype)
 
+    # nothing to select
+    if k <= 0 or query_rows == 0:
+        return indices, distances
+
     # TODO: figure out appropriate batch size from available memory
     cdef int batch_size = 100 # TODO
 

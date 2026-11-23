@@ -6,6 +6,7 @@ import numpy as np
 from scipy.sparse import csr_matrix, lil_matrix
 
 from ..recommender_base import RecommenderBase
+from ..utils import _check_items
 from .topk import topk
 
 
@@ -42,10 +43,10 @@ class MatrixFactorizationBase(RecommenderBase):
         recalculate_user=False,
         items=None,
     ):
+        user_count = 1 if np.isscalar(userid) else len(userid)
         if filter_already_liked_items or recalculate_user:
             if not isinstance(user_items, csr_matrix):
                 raise ValueError("user_items needs to be a CSR sparse matrix")
-            user_count = 1 if np.isscalar(userid) else len(userid)
             if user_items.shape[0] != user_count:
                 raise ValueError("user_items must contain 1 row for every user in userids")
 
@@ -56,17 +57,37 @@ class MatrixFactorizationBase(RecommenderBase):
         # if we have an item list to restrict down to, we need to filter the item_factors
         # and filter_query_items
         if items is not None:
+            items, per_user = _check_items(items, user_count, item_factors.shape[0])
+
+            # remove any explicitly filtered out items from the candidate sets
+            if filter_items is not None:
+                if per_user:
+                    items = [np.setdiff1d(candidates, filter_items) for candidates in items]
+                else:
+                    items = np.setdiff1d(items, filter_items)
+                filter_items = None
+
+            # each user has their own candidate set: rank each set separately and
+            # return ragged lists of ids/scores, one per user
+            if per_user:
+                ids, scores = self._recommend_per_user_items(
+                    user, user_items, items, N, filter_already_liked_items
+                )
+                if np.isscalar(userid):
+                    ids, scores = ids[0], scores[0]
+                return ids, scores
+
             N = min(N, len(items))
-            if filter_items:
-                raise ValueError("Can't set both items and filter_items in recommend call")
+            if N == 0:
+                # an empty candidate set means empty results: don't fall back
+                # to scoring every item in the model
+                ids = np.zeros((user_count, 0), dtype=np.int32)
+                scores = np.zeros((user_count, 0), dtype=user.dtype)
+                if np.isscalar(userid):
+                    ids, scores = ids[0], scores[0]
+                return ids, scores
 
-            items = np.array(items)
-            items.sort()
             item_factors = item_factors[items]
-
-            # check selected items are in the model
-            if items.max() >= self.item_factors.shape[0] or items.min() < 0:
-                raise IndexError("Some itemids in the items parameter in are not in the model")
 
         # get a CSR matrix of items to filter per-user
         filter_query_items = None
@@ -94,6 +115,42 @@ class MatrixFactorizationBase(RecommenderBase):
             ids = items[ids]
 
         return ids, scores
+
+    def _recommend_per_user_items(self, user, user_items, items, N, filter_already_liked_items):
+        """Ranks a different candidate set of items for each user.
+
+        Returns a tuple of (ids, scores) lists, with one array per user. Each user
+        gets at most N results: users with fewer valid candidates (after removing
+        already liked items) get correspondingly shorter arrays, and users with no
+        valid candidates get empty arrays.
+        """
+        user = np.atleast_2d(user)
+
+        indptr = indices = None
+        if filter_already_liked_items:
+            indptr, indices = user_items.indptr, user_items.indices
+
+        all_ids, all_scores = [], []
+        for i, candidates in enumerate(items):
+            # remove items the user has already liked from their candidate set
+            if filter_already_liked_items:
+                liked = indices[indptr[i] : indptr[i + 1]]
+                if len(liked):
+                    candidates = np.setdiff1d(candidates, liked)
+
+            count = min(N, len(candidates))
+            if count == 0:
+                all_ids.append(np.array([], dtype=np.int32))
+                all_scores.append(np.array([], dtype=user.dtype))
+                continue
+
+            ids, scores = topk(
+                self.item_factors[candidates], user[i], count, num_threads=self.num_threads
+            )
+            all_ids.append(candidates[ids[0]])
+            all_scores.append(scores[0])
+
+        return all_ids, all_scores
 
     def recommend_all(
         self,
