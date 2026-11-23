@@ -4,17 +4,22 @@ import nmslib
 import numpy as np
 from scipy.sparse import csr_matrix
 
-import implicit.gpu
-from implicit.recommender_base import RecommenderBase
+from implicit.ann.base import ANNModelBase
 from implicit.utils import _batch_call, _filter_items_from_results, augment_inner_product_matrix
 
 log = logging.getLogger("implicit")
 
 
-class NMSLibModel(RecommenderBase):
+class NMSLibModel(ANNModelBase):
     """Speeds up inference calls to MatrixFactorization models by using
     `NMSLib <https://github.com/nmslib/nmslib>`_ to create approximate nearest neighbours
     indices of the latent factors.
+
+    The factors searched by the indices are bound together into an immutable version
+    snapshot (see :class:`implicit.ann.base.ANNModelVersion`). Refitting the model or
+    calling :meth:`partial_fit_items` builds a fresh set of indices off to the side and
+    atomically swaps in a new version, so online queries always use indices built from
+    the factors in the same version -- a failed rebuild leaves the previous version live.
 
     Parameters
     ----------
@@ -34,12 +39,12 @@ class NMSLibModel(RecommenderBase):
     Attributes
     ----------
     similar_items_index : nmslib.FloatIndex
-        NMSLib index for looking up similar items in the cosine space formed by the latent
-        item_factors
+        NMSLib index of the currently published version, looking up similar items in the
+        cosine space formed by the latent item_factors
 
     recommend_index : nmslib.FloatIndex
-        NMSLib index for looking up similar items in the inner product space formed by the latent
-        item_factors
+        NMSLib index of the currently published version, looking up similar items in the
+        inner product space formed by the latent item_factors
     """
 
     def __init__(
@@ -52,63 +57,53 @@ class NMSLibModel(RecommenderBase):
         query_params=None,
         **kwargs,
     ):
-        self.model = model
+        super().__init__(
+            model,
+            approximate_similar_items=approximate_similar_items,
+            approximate_recommend=approximate_recommend,
+        )
         if index_params is None:
             index_params = {"M": 16, "post": 0, "efConstruction": 400}
         if query_params is None:
             query_params = {"ef": 90}
 
-        self.similar_items_index = None
-        self.recommend_index = None
-
-        self.approximate_similar_items = approximate_similar_items
-        self.approximate_recommend = approximate_recommend
         self.method = method
-
         self.index_params = index_params
         self.query_params = query_params
 
-        self.max_norm = None
-
-    def fit(self, Cui, show_progress=True, callback=None):
+    def _build_similar_items_index(self, item_factors, show_progress):
         # nmslib can be a little chatty when first imported, disable some of
         # the logging
         logging.getLogger("nmslib").setLevel(logging.WARNING)
 
-        # train the model
-        self.model.fit(Cui, show_progress, callback=callback)
-        item_factors = self.model.item_factors
-        if implicit.gpu.HAS_CUDA and isinstance(item_factors, implicit.gpu.Matrix):
-            item_factors = item_factors.to_numpy()
+        log.debug("Building nmslib similar items index")
+        index = nmslib.init(method=self.method, space="cosinesimil")
 
-        # create index for similar_items
-        if self.approximate_similar_items:
-            log.debug("Building nmslib similar items index")
-            self.similar_items_index = nmslib.init(method=self.method, space="cosinesimil")
+        # there are some numerical instability issues here with
+        # building a cosine index with vectors with 0 norms, hack around this
+        # by just not indexing them
+        norms = np.linalg.norm(item_factors, axis=1)
+        ids = np.arange(item_factors.shape[0])
 
-            # there are some numerical instability issues here with
-            # building a cosine index with vectors with 0 norms, hack around this
-            # by just not indexing them
-            norms = np.linalg.norm(item_factors, axis=1)
-            ids = np.arange(item_factors.shape[0])
+        # delete zero valued rows from the matrix
+        nonzero_item_factors = np.delete(item_factors, ids[norms == 0], axis=0)
+        ids = ids[norms != 0]
 
-            # delete zero valued rows from the matrix
-            nonzero_item_factors = np.delete(item_factors, ids[norms == 0], axis=0)
-            ids = ids[norms != 0]
+        index.addDataPointBatch(nonzero_item_factors, ids=ids)
+        index.createIndex(self.index_params, print_progress=show_progress)
+        index.setQueryTimeParams(self.query_params)
+        return index
 
-            self.similar_items_index.addDataPointBatch(nonzero_item_factors, ids=ids)
-            self.similar_items_index.createIndex(self.index_params, print_progress=show_progress)
-            self.similar_items_index.setQueryTimeParams(self.query_params)
+    def _build_recommend_index(self, item_factors, show_progress):
+        logging.getLogger("nmslib").setLevel(logging.WARNING)
 
-        # build up a separate index for the inner product (for recommend
-        # methods)
-        if self.approximate_recommend:
-            log.debug("Building nmslib recommendation index")
-            self.max_norm, extra = augment_inner_product_matrix(item_factors)
-            self.recommend_index = nmslib.init(method="hnsw", space="cosinesimil")
-            self.recommend_index.addDataPointBatch(extra)
-            self.recommend_index.createIndex(self.index_params, print_progress=show_progress)
-            self.recommend_index.setQueryTimeParams(self.query_params)
+        log.debug("Building nmslib recommendation index")
+        max_norm, extra = augment_inner_product_matrix(item_factors)
+        index = nmslib.init(method="hnsw", space="cosinesimil")
+        index.addDataPointBatch(extra)
+        index.createIndex(self.index_params, print_progress=show_progress)
+        index.setQueryTimeParams(self.query_params)
+        return index, max_norm
 
     def similar_items(
         self, itemid, N=10, recalculate_item=False, item_users=None, filter_items=None, items=None
@@ -126,24 +121,25 @@ class NMSLibModel(RecommenderBase):
         if items is not None:
             raise NotImplementedError("using an items filter isn't supported with ANN lookup")
 
+        version = self.active_version
+
         # support recalculate_item if possible. TODO: refactor this
         if hasattr(self.model, "_item_factor"):
             factors = self.model._item_factor(itemid, item_users, recalculate_item)  # pylint: disable=protected-access
         elif recalculate_item:
             raise NotImplementedError(f"recalculate_item isn't supported with {self.model}")
         else:
-            factors = self.model.item_factors[itemid]
-            if implicit.gpu.HAS_CUDA and isinstance(factors, implicit.gpu.Matrix):
-                factors = factors.to_numpy()
+            # use the factor snapshot bound to the index being queried
+            factors = version.item_factors[itemid]
 
         count = N
         if filter_items is not None:
             count += len(filter_items)
 
         if np.isscalar(itemid):
-            ids, scores = self.similar_items_index.knnQuery(factors, count)
+            ids, scores = version.similar_items_index.knnQuery(factors, count)
         else:
-            results = self.similar_items_index.knnQueryBatch(factors, count)
+            results = version.similar_items_index.knnQueryBatch(factors, count)
             ids = np.stack([result[0] for result in results])
             scores = np.stack([result[1] for result in results])
 
@@ -195,15 +191,16 @@ class NMSLibModel(RecommenderBase):
                 items=items,
             )
 
+        version = self.active_version
+
         # support recalculate_user if possible (TODO: come back to this since its a bit of a hack)
-        if hasattr(self.model, "+_user_factor"):
+        if hasattr(self.model, "_user_factor"):
             user = self.model._user_factor(userid, user_items, recalculate_user)  # pylint: disable=protected-access
         elif recalculate_user:
             raise NotImplementedError(f"recalculate_user isn't supported with {self.model}")
         else:
-            user = self.model.user_factors[userid]
-            if implicit.gpu.HAS_CUDA and isinstance(user, implicit.gpu.Matrix):
-                user = user.to_numpy()
+            # use the factor snapshot bound to the index being queried
+            user = version.user_factors[userid]
 
         # calculate the top N items, removing the users own liked items from
         # the results
@@ -220,24 +217,11 @@ class NMSLibModel(RecommenderBase):
             count += len(user_likes)
 
         query = np.append(user, 0)
-        ids, scores = self.recommend_index.knnQuery(query, count)
-        scaling = self.max_norm * np.linalg.norm(query)
+        ids, scores = version.recommend_index.knnQuery(query, count)
+        scaling = version.max_norm * np.linalg.norm(query)
         scores = scaling * (1.0 - (scores))
 
         if filter_items is not None:
             ids, scores = _filter_items_from_results(userid, ids, scores, filter_items, N)
 
         return ids, scores
-
-    def similar_users(self, userid, N=10, filter_users=None, users=None):
-        raise NotImplementedError(
-            "similar_users isn't implemented with NMSLib yet. (note: you can call "
-            " self.model.similar_models to get the same functionality on the inner model class)"
-        )
-
-    def save(self, file):
-        raise NotImplementedError(".save isn't implemented for NMSLib yet")
-
-    @classmethod
-    def load(cls, file):
-        raise NotImplementedError(".load isn't implemented for NMSLib yet")

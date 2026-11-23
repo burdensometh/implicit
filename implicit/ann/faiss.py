@@ -6,7 +6,7 @@ import numpy as np
 from scipy.sparse import csr_matrix
 
 import implicit.gpu
-from implicit.recommender_base import RecommenderBase
+from implicit.ann.base import ANNModelBase
 from implicit.utils import _batch_call, _filter_items_from_results
 
 log = logging.getLogger("implicit")
@@ -15,11 +15,17 @@ log = logging.getLogger("implicit")
 # pylint:  disable=no-value-for-parameter
 
 
-class FaissModel(RecommenderBase):
+class FaissModel(ANNModelBase):
     """
     Speeds up inference calls to MatrixFactorization models by using
     `Faiss <https://github.com/facebookresearch/faiss>`_ to create approximate nearest neighbours
     indices of the latent factors.
+
+    The factors searched by the indices are bound together into an immutable version
+    snapshot (see :class:`implicit.ann.base.ANNModelVersion`). Refitting the model or
+    calling :meth:`partial_fit_items` builds a fresh set of indices off to the side and
+    atomically swaps in a new version, so online queries always use indices built from
+    the factors in the same version -- a failed rebuild leaves the previous version live.
 
     Parameters
     ----------
@@ -40,12 +46,12 @@ class FaissModel(RecommenderBase):
     Attributes
     ----------
     similar_items_index : faiss.IndexIVFFlat
-        Faiss index for looking up similar items in the cosine space formed by the latent
-        item_factors
+        Faiss index of the currently published version, looking up similar items in the
+        cosine space formed by the latent item_factors
 
     recommend_index : faiss.IndexIVFFlat
-        Faiss index for looking up similar items in the inner product space formed by the latent
-        item_factors
+        Faiss index of the currently published version, looking up similar items in the
+        inner product space formed by the latent item_factors
     """
 
     def __init__(
@@ -55,79 +61,57 @@ class FaissModel(RecommenderBase):
         approximate_recommend=True,
         nlist=400,
         nprobe=20,
-        use_gpu=implicit.gpu.HAS_CUDA,
+        use_gpu=None,
     ):
-        self.model = model
-        self.similar_items_index = None
-        self.recommend_index = None
-        self.quantizer = None
-        self.gpu_resources = None
-        self.factors = None
+        if use_gpu is None:
+            use_gpu = implicit.gpu.HAS_CUDA
 
-        self.approximate_similar_items = approximate_similar_items
-        self.approximate_recommend = approximate_recommend
-
+        super().__init__(
+            model,
+            approximate_similar_items=approximate_similar_items,
+            approximate_recommend=approximate_recommend,
+        )
         # hyper-parameters for FAISS
         self.nlist = nlist
         self.nprobe = nprobe
         self.use_gpu = use_gpu
-        super().__init__()
 
-    def fit(self, Cui, show_progress=True, callback=None):
-        self.model.fit(Cui, show_progress, callback=callback)
-
-        item_factors = self.model.item_factors
-        if implicit.gpu.HAS_CUDA and isinstance(item_factors, implicit.gpu.Matrix):
-            item_factors = item_factors.to_numpy()
-        item_factors = item_factors.astype("float32")
-
-        self.factors = item_factors.shape[1]
-
-        self.quantizer = faiss.IndexFlat(self.factors)
-
+    def _create_index(self, factors, gpu_resources):
         if self.use_gpu:
-            self.gpu_resources = faiss.StandardGpuResources()
+            return faiss.GpuIndexIVFFlat(
+                gpu_resources, factors, self.nlist, faiss.METRIC_INNER_PRODUCT
+            )
+        quantizer = faiss.IndexFlat(factors)
+        return faiss.IndexIVFFlat(quantizer, factors, self.nlist, faiss.METRIC_INNER_PRODUCT)
 
-        if self.approximate_recommend:
-            log.debug("Building faiss recommendation index")
+    def _build_recommend_index(self, item_factors, show_progress):
+        log.debug("Building faiss recommendation index")
+        gpu_resources = faiss.StandardGpuResources() if self.use_gpu else None
 
-            # build up a inner product index here
-            if self.use_gpu:
-                index = faiss.GpuIndexIVFFlat(
-                    self.gpu_resources, self.factors, self.nlist, faiss.METRIC_INNER_PRODUCT
-                )
-            else:
-                index = faiss.IndexIVFFlat(
-                    self.quantizer, self.factors, self.nlist, faiss.METRIC_INNER_PRODUCT
-                )
+        # build up an inner product index here
+        index = self._create_index(item_factors.shape[1], gpu_resources)
+        index.train(item_factors)
+        index.add(item_factors)
+        index.nprobe = self.nprobe
 
-            index.train(item_factors)
-            index.add(item_factors)
-            index.nprobe = self.nprobe
-            self.recommend_index = index
+        # faiss searches raw inner products, no angular transformation / max_norm needed
+        return index, None
 
-        if self.approximate_similar_items:
-            log.debug("Building faiss similar items index")
+    def _build_similar_items_index(self, item_factors, show_progress):
+        log.debug("Building faiss similar items index")
+        gpu_resources = faiss.StandardGpuResources() if self.use_gpu else None
 
-            # likewise build up cosine index for similar_items, using an inner product
-            # index on normalized vectors`
-            norms = np.linalg.norm(item_factors, axis=1)
-            norms[norms == 0] = 1e-10
+        # build up cosine index for similar_items, using an inner product
+        # index on normalized vectors
+        norms = np.linalg.norm(item_factors, axis=1)
+        norms[norms == 0] = 1e-10
 
-            normalized = (item_factors.T / norms).T.astype("float32")
-            if self.use_gpu:
-                index = faiss.GpuIndexIVFFlat(
-                    self.gpu_resources, self.factors, self.nlist, faiss.METRIC_INNER_PRODUCT
-                )
-            else:
-                index = faiss.IndexIVFFlat(
-                    self.quantizer, self.factors, self.nlist, faiss.METRIC_INNER_PRODUCT
-                )
-
-            index.train(normalized)
-            index.add(normalized)
-            index.nprobe = self.nprobe
-            self.similar_items_index = index
+        normalized = (item_factors.T / norms).T.astype("float32")
+        index = self._create_index(item_factors.shape[1], gpu_resources)
+        index.train(normalized)
+        index.add(normalized)
+        index.nprobe = self.nprobe
+        return index
 
     def similar_items(
         self, itemid, N=10, recalculate_item=False, item_users=None, filter_items=None, items=None
@@ -149,15 +133,16 @@ class FaissModel(RecommenderBase):
                 items=items,
             )
 
+        version = self.active_version
+
         # support recalculate_item if possible. TODO: refactor this
         if hasattr(self.model, "_item_factor"):
             factors = self.model._item_factor(itemid, item_users, recalculate_item)  # pylint: disable=protected-access
         elif recalculate_item:
             raise NotImplementedError(f"recalculate_item isn't supported with {self.model}")
         else:
-            factors = self.model.item_factors[itemid]
-            if implicit.gpu.HAS_CUDA and isinstance(factors, implicit.gpu.Matrix):
-                factors = factors.to_numpy()
+            # use the factor snapshot bound to the index being queried
+            factors = version.item_factors[itemid]
 
         if np.isscalar(itemid):
             factors /= np.linalg.norm(factors)
@@ -165,7 +150,7 @@ class FaissModel(RecommenderBase):
         else:
             factors /= np.linalg.norm(factors, axis=1)[:, None]
 
-        scores, ids = self.similar_items_index.search(factors.astype("float32"), count)
+        scores, ids = version.similar_items_index.search(factors.astype("float32"), count)
 
         if np.isscalar(itemid):
             ids, scores = ids[0], scores[0]
@@ -208,7 +193,10 @@ class FaissModel(RecommenderBase):
             )
 
         if not self.approximate_recommend:
-            warnings.warning("Calling recommend on a FaissModel with approximate_recommend=False")
+            warnings.warn(
+                "Calling recommend on a FaissModel with approximate_recommend=False",
+                stacklevel=2,
+            )
             return self.model.recommend(
                 userid,
                 user_items,
@@ -219,15 +207,16 @@ class FaissModel(RecommenderBase):
                 items=items,
             )
 
+        version = self.active_version
+
         # support recalculate_user if possible (TODO: come back to this since its a bit of a hack)
-        if hasattr(self.model, "+_user_factor"):
+        if hasattr(self.model, "_user_factor"):
             user = self.model._user_factor(userid, user_items, recalculate_user)  # pylint: disable=protected-access
         elif recalculate_user:
             raise NotImplementedError(f"recalculate_user isn't supported with {self.model}")
         else:
-            user = self.model.user_factors[userid]
-            if implicit.gpu.HAS_CUDA and isinstance(user, implicit.gpu.Matrix):
-                user = user.to_numpy()
+            # use the factor snapshot bound to the index being queried
+            user = version.user_factors[userid]
 
         # calculate the top N items, removing the users own liked items from
         # the results
@@ -261,7 +250,7 @@ class FaissModel(RecommenderBase):
         else:
             query = user.astype("float32")
 
-        scores, ids = self.recommend_index.search(query, count)
+        scores, ids = version.recommend_index.search(query, count)
 
         if np.isscalar(userid):
             ids, scores = ids[0], scores[0]
@@ -270,16 +259,3 @@ class FaissModel(RecommenderBase):
             ids, scores = _filter_items_from_results(userid, ids, scores, filter_items, N)
 
         return ids, scores
-
-    def similar_users(self, userid, N=10, filter_users=None, users=None):
-        raise NotImplementedError(
-            "similar_users isn't implemented with Faiss yet. (note: you can call "
-            " self.model.similar_models to get the same functionality on the inner model class)"
-        )
-
-    def save(self, file):
-        raise NotImplementedError(".save isn't implemented for Faiss yet")
-
-    @classmethod
-    def load(cls, file):
-        raise NotImplementedError(".load isn't implemented for Faiss yet")
