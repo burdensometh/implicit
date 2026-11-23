@@ -70,6 +70,25 @@ last.fm dataset](https://github.com/benfred/implicit/blob/master/examples/lastfm
 
 For more information see the [documentation](https://benfred.github.io/implicit/).
 
+#### Time based evaluation
+
+`implicit.evaluation.train_test_split` holds out matrix entries at random, which lets a model
+see interactions that happened *after* the ones it is evaluated on. To backtest on a temporal
+cutoff instead, use `implicit.backtest`:
+
+```python
+from implicit.backtest import time_based_split, evaluate_time_based_split
+
+# events: pandas DataFrame / dict / structured array / 2d array of
+# (user, item, timestamp[, value[, positive]])
+train, validation, report = time_based_split(events, cutoff="2024-06-01", return_report=True)
+print(report.summary())  # also lists accounts with too little history
+
+model.fit(train)
+metrics = evaluate_time_based_split(model, train, validation, K=10)
+```
+
+
 #### Articles about Implicit
 
 These blog posts describe the algorithms that power this library:

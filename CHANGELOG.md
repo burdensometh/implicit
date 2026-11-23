@@ -1,3 +1,14 @@
+## Unreleased
+
+### New Features
+
+* Add `implicit.backtest` for time based train/validation splits. `time_based_split`
+  splits a timestamped event log on a single global cutoff, keeps only post-cutoff
+  positive feedback that the user had not already interacted with as validation
+  targets, fixes the user/item axes across both matrices, and reports accounts
+  without enough pre-cutoff history. `evaluate_time_based_split` feeds the split
+  straight into the ranking metrics.
+
 ## v0.5.0
 
 ### Breaking API Changes
