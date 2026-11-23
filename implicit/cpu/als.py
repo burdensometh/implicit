@@ -10,6 +10,7 @@ import scipy
 import scipy.sparse
 from tqdm.auto import tqdm
 
+from ..recommender_base import ModelFitError
 from ..utils import check_blas_config, check_csr, check_random_state, nonzeros
 from . import _als
 from .matrix_factorization_base import MatrixFactorizationBase
@@ -347,6 +348,203 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
         # clear any cached properties that are invalidated by this update
         self._item_norms = None
         self._YtY = None
+
+    def partial_fit(self, userids, user_items, itemids, item_users):
+        """Atomically refreshes factors for a batch of users and items together
+
+        This method is the batched equivalent of calling :meth:`partial_fit_users`
+        followed by :meth:`partial_fit_items`, but with transactional semantics:
+
+        * All inputs on both sides are validated up front (ids, sparse shapes and
+          the column indices referenced by each side). Nothing is stored on the
+          model when validation fails, so the previous complete version of the
+          model stays visible.
+        * The new user factors are calculated first, using the currently stored
+          item factors. The new item factors are then calculated from the newly
+          calculated user factors - the same ordering used by :meth:`fit`.
+        * Both factor matrices (including storage for any new users/items) and the
+          invalidated caches are only swapped in once every factor has been
+          calculated successfully. A failure while solving either side leaves the
+          model completely untouched, instead of committing only one side.
+
+        Parameters
+        ----------
+        userids : array_like
+            An array of userids to calculate new factors for
+        user_items : csr_matrix
+            Sparse matrix containing the liked items for each user in userids.
+            Each row in this matrix corresponds to a row in userids, and the
+            column indices must reference valid item ids.
+        itemids : array_like
+            An array of itemids to calculate new factors for
+        item_users : csr_matrix
+            Sparse matrix containing the liked users for each item in itemids.
+            Each row in this matrix corresponds to a row in itemids, and the
+            column indices must reference valid user ids.
+        """
+        userids, itemids, user_items, item_users = self._check_partial_fit_inputs(
+            userids, user_items, itemids, item_users
+        )
+
+        # Everything below works on local copies, so that an error while solving
+        # either side leaves the stored model untouched.
+        user_factors = self.user_factors
+        item_factors = self.item_factors
+        factors = self.factors
+
+        # grow the working copy of the user factors first, so that the item solve
+        # below can reference the newly added users as well
+        max_userid = int(userids.max(initial=-1))
+        if max_userid >= user_factors.shape[0]:
+            user_factors = np.concatenate(
+                [
+                    user_factors,
+                    np.zeros(
+                        (max_userid + 1 - user_factors.shape[0], factors), dtype=self.dtype
+                    ),
+                ]
+            )
+
+        # 1st step: recalculate the user factors from the (unchanged) item factors
+        new_user_factors = self._solve_partial_factors(
+            user_items, item_factors, self._YtY, userids.size
+        )
+
+        if not np.isfinite(new_user_factors).all():
+            raise ModelFitError("NaN encountered while recalculating user factors in partial_fit")
+
+        # build the working user factor matrix the item solve is based on
+        if max_userid >= self.user_factors.shape[0]:
+            user_factors[userids] = new_user_factors
+        else:
+            user_factors = self.user_factors.copy()
+            user_factors[userids] = new_user_factors
+
+        # grow the working copy of the item factors for any new items
+        max_itemid = int(itemids.max(initial=-1))
+        if max_itemid >= item_factors.shape[0]:
+            item_factors = np.concatenate(
+                [
+                    item_factors,
+                    np.zeros(
+                        (max_itemid + 1 - item_factors.shape[0], factors), dtype=self.dtype
+                    ),
+                ]
+            )
+
+        # 2nd step: recalculate the item factors from the new user factors.
+        # pass None so the gram matrix is computed from the new user factors,
+        # matching partial_fit_users invalidating the cached XtX
+        new_item_factors = self._solve_partial_factors(
+            item_users, user_factors, None, itemids.size
+        )
+
+        if not np.isfinite(new_item_factors).all():
+            raise ModelFitError("NaN encountered while recalculating item factors in partial_fit")
+
+        # all calculations succeeded: commit both sides together, and invalidate
+        # every cache that depends on the factors
+        if max_itemid >= self.item_factors.shape[0]:
+            self.item_factors = item_factors
+        else:
+            self.item_factors = self.item_factors.copy()
+        self.item_factors[itemids] = new_item_factors
+        self.user_factors = user_factors
+
+        self._user_norms = None
+        self._item_norms = None
+        self._XtX = None
+        self._YtY = None
+
+    def _check_partial_fit_inputs(self, userids, user_items, itemids, item_users):
+        """Validates the ids and sparse matrices passed to :meth:`partial_fit`
+
+        Raises ValueError with a descriptive message before any factor is
+        calculated or stored, whenever the two sides are inconsistent.
+        """
+        if self.user_factors is None or self.item_factors is None:
+            raise ValueError("cannot call partial_fit on a model that hasn't been fit yet")
+
+        try:
+            userids = np.asarray(userids)
+            itemids = np.asarray(itemids)
+        except Exception as e:
+            raise ValueError("userids and itemids must both be array_like of integers") from e
+
+        if userids.ndim != 1 or itemids.ndim != 1:
+            raise ValueError("userids and itemids must both be 1 dimensional arrays")
+        # np.asarray([]) defaults to float64, coerce empty id arrays to integers
+        if userids.size == 0:
+            userids = userids.astype(np.intp)
+        if itemids.size == 0:
+            itemids = itemids.astype(np.intp)
+        if not np.issubdtype(userids.dtype, np.integer) or not np.issubdtype(
+            itemids.dtype, np.integer
+        ):
+            raise ValueError("userids and itemids must both contain integer ids")
+        if userids.size and int(userids.min()) < 0:
+            raise ValueError("userids must not contain negative ids")
+        if itemids.size and int(itemids.min()) < 0:
+            raise ValueError("itemids must not contain negative ids")
+
+        user_items = check_csr(user_items)
+        item_users = check_csr(item_users)
+
+        if user_items.shape[0] != userids.size:
+            raise ValueError(
+                f"user_items must contain 1 row for every user in userids: "
+                f"got {user_items.shape[0]} rows for {userids.size} userids"
+            )
+        if item_users.shape[0] != itemids.size:
+            raise ValueError(
+                f"item_users must contain 1 row for every item in itemids: "
+                f"got {item_users.shape[0]} rows for {itemids.size} itemids"
+            )
+
+        # the ids referenced by each sparse side have to be valid keys on the
+        # opposite factor matrix (including the ids that will be newly added in
+        # this batch), otherwise the native solver would read out of bounds.
+        # Only the indices actually used matter - trailing zero columns are fine
+        max_item_key = max(self.item_factors.shape[0] - 1, int(itemids.max(initial=-1)))
+        if user_items.nnz and int(user_items.indices.max()) > max_item_key:
+            raise ValueError(
+                f"user_items references item id {int(user_items.indices.max())}, "
+                f"which is not present in the model or in itemids"
+            )
+
+        max_user_key = max(self.user_factors.shape[0] - 1, int(userids.max(initial=-1)))
+        if item_users.nnz and int(item_users.indices.max()) > max_user_key:
+            raise ValueError(
+                f"item_users references user id {int(item_users.indices.max())}, "
+                f"which is not present in the model or in userids"
+            )
+
+        return userids, itemids, user_items, item_users
+
+    def _solve_partial_factors(self, interactions, other_factors, other_gram, count):
+        """Recalculates a batch of factors against the opposite side factors
+
+        Mirrors the cholesky solve used by recalculate_user/recalculate_item,
+        without touching any state stored on the model.
+        """
+        if count == 0:
+            return np.zeros((0, self.factors), dtype=self.dtype)
+
+        if self.alpha != 1.0:
+            interactions = self.alpha * interactions
+
+        factors = np.zeros((count, self.factors), dtype=self.dtype)
+        _als._least_squares(
+            other_gram if other_gram is not None else other_factors.T.dot(other_factors),
+            interactions.indptr,
+            interactions.indices,
+            interactions.data.astype("float32"),
+            factors,
+            other_factors,
+            self.regularization,
+            num_threads=self.num_threads,
+        )
+        return factors
 
     def explain(self, userid, user_items, itemid, user_weights=None, N=10):
         """Provides explanations for why the item is liked by the user.

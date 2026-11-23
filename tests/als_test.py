@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 from numpy.testing import assert_array_equal
 from recommender_base_test import RecommenderBaseTestMixin, get_checker_board
-from scipy.sparse import coo_matrix, csr_matrix, random
+from scipy.sparse import coo_matrix, csr_matrix, random, vstack
 
 import implicit
 from implicit.als import AlternatingLeastSquares
@@ -363,3 +363,212 @@ def test_calculate_loss_segfault():
 
     loss = implicit.cpu.als.calculate_loss(c_ui, user_factors, item_factors, regularization)
     assert loss > 0
+
+
+def _fitted_partial_model(alpha=1.0):
+    likes = get_checker_board(50)
+    model = AlternatingLeastSquares(
+        factors=8, regularization=0.1, alpha=alpha, use_gpu=False, random_state=23
+    )
+    model.fit(likes, show_progress=False)
+    return likes, model
+
+
+def test_partial_fit_matches_sequential_partial_fit():
+    likes, model = _fitted_partial_model(alpha=2.0)
+
+    userids = np.array([0, 1, 2])
+    itemids = np.array([3, 4, 50])
+    # new item 50 is liked by the new user 100 and existing users 0/1. Both
+    # feedback matrices use the post-batch key spaces (101 users and 101 items)
+    user_items = likes[userids]
+    user_items = csr_matrix(
+        (user_items.data, user_items.indices, user_items.indptr),
+        shape=(user_items.shape[0], 101),
+    )
+    # item side: rows for items 3, 4 taken from the transposed feedback, widened
+    # to 101 columns, plus a brand new item 50 interacting with users 0, 1, 100
+    existing_item_users = likes.T.tocsr()[itemids[:-1]]
+    item_users = csr_matrix(
+        (
+            existing_item_users.data,
+            existing_item_users.indices,
+            existing_item_users.indptr,
+        ),
+        shape=(existing_item_users.shape[0], 101),
+    )
+    item_users = vstack(
+        [
+            item_users,
+            csr_matrix(
+                (np.ones(3, dtype=np.float32), np.array([0, 1, 100]), np.array([0, 3])),
+                shape=(1, 101),
+            ),
+        ]
+    ).tocsr()
+    new_user_items = csr_matrix(likes[1], shape=(1, 101))
+
+    # reference: the existing one-sided partial fit calls, in the same order
+    reference = AlternatingLeastSquares(
+        factors=8, regularization=0.1, alpha=2.0, use_gpu=False, random_state=23
+    )
+    reference.fit(likes, show_progress=False)
+    reference.partial_fit_users(
+        np.append(userids, 100), vstack([user_items, new_user_items])
+    )
+    reference.partial_fit_items(itemids, item_users)
+
+    model.partial_fit(
+        np.append(userids, 100), vstack([user_items, new_user_items]),
+        itemids, item_users,
+    )
+
+    np.testing.assert_allclose(model.user_factors, reference.user_factors, rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(model.item_factors, reference.item_factors, rtol=1e-5, atol=1e-6)
+
+
+def test_partial_fit_adds_new_users_and_items_together():
+    likes, model = _fitted_partial_model()
+
+    # a brand new user at id 100 and a brand new item at id 100, refreshed in
+    # one atomic batch
+    new_user_items = csr_matrix(([1.0], [0], [0, 1]), shape=(1, 101))
+    new_item_users = csr_matrix(([1.0], [100], [0, 1]), shape=(1, 101))
+
+    model.partial_fit(np.array([100]), new_user_items, np.array([100]), new_item_users)
+
+    assert model.user_factors.shape == (101, 8)
+    assert model.item_factors.shape == (101, 8)
+
+    # the new item should show up as similar to item 0 (both liked by user 100)
+    ids, _ = model.similar_items(100, N=2)
+    assert 0 in ids
+
+    # recommendations work for the new user
+    ids, _ = model.recommend(100, new_user_items, N=5)
+    assert 100 in ids
+
+
+def test_partial_fit_validates_keys_and_shapes_before_touching_model():
+    likes, model = _fitted_partial_model()
+    original_user_factors = model.user_factors.copy()
+    original_item_factors = model.item_factors.copy()
+
+    good_user_items = likes[np.array([0])]
+    good_item_users = likes.T.tocsr()[np.array([0])]
+
+    # row count mismatch on the user side
+    with pytest.raises(ValueError, match="user_items must contain 1 row"):
+        model.partial_fit(np.array([0, 1]), likes[np.array([0])],
+                          np.array([0]), good_item_users)
+
+    # row count mismatch on the item side
+    with pytest.raises(ValueError, match="item_users must contain 1 row"):
+        model.partial_fit(np.array([0]), good_user_items,
+                          np.array([0, 1]), good_item_users)
+
+    # user_items references an item id that neither exists nor is in itemids
+    bad_user_items = csr_matrix(([1.0], [99], [0, 1]), shape=(1, 100))
+    with pytest.raises(ValueError, match="user_items references item id"):
+        model.partial_fit(np.array([0]), bad_user_items,
+                          np.array([0]), good_item_users)
+
+    # item_users references a user id that neither exists nor is in userids
+    bad_item_users = csr_matrix(([1.0], [99], [0, 1]), shape=(1, 100))
+    with pytest.raises(ValueError, match="item_users references user id"):
+        model.partial_fit(np.array([0]), good_user_items,
+                          np.array([0]), bad_item_users)
+
+    # negative ids are rejected
+    with pytest.raises(ValueError, match="negative"):
+        model.partial_fit(np.array([-1]), good_user_items,
+                          np.array([0]), good_item_users)
+    with pytest.raises(ValueError, match="negative"):
+        model.partial_fit(np.array([0]), good_user_items,
+                          np.array([-1]), good_item_users)
+
+    # nothing was committed: the previous complete version is still visible
+    np.testing.assert_array_equal(model.user_factors, original_user_factors)
+    np.testing.assert_array_equal(model.item_factors, original_item_factors)
+
+
+def test_partial_fit_failure_keeps_previous_version():
+    likes, model = _fitted_partial_model()
+    original_user_factors = model.user_factors.copy()
+    original_item_factors = model.item_factors.copy()
+
+    # force the item side solve to fail after the user side has succeeded:
+    # validation passes (ids are in range), but monkeypatch the native solver
+    # to blow up on the 2nd (item side) call
+    calls = {"n": 0}
+    original_solver = implicit.cpu.als._als._least_squares
+
+    def failing_solver(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise ValueError("simulated item side failure")
+        return original_solver(*args, **kwargs)
+
+    implicit.cpu.als._als._least_squares = failing_solver
+    try:
+        with pytest.raises(ValueError, match="simulated item side failure"):
+            model.partial_fit(
+                np.array([0]), likes[np.array([0])],
+                np.array([0]), likes.T.tocsr()[np.array([0])],
+            )
+    finally:
+        implicit.cpu.als._als._least_squares = original_solver
+
+    # neither side was committed, and the caches were not invalidated
+    np.testing.assert_array_equal(model.user_factors, original_user_factors)
+    np.testing.assert_array_equal(model.item_factors, original_item_factors)
+
+
+def test_partial_fit_invalidates_cached_similarities():
+    likes, model = _fitted_partial_model()
+
+    # populate the similarity caches from the previous complete version
+    old_item_norms = model.item_norms.copy()
+    old_user_norms = model.user_norms.copy()
+    assert model._item_norms is not None and model._user_norms is not None
+
+    model.partial_fit(
+        np.array([0, 1]), likes[np.array([0, 1])],
+        np.array([0, 1]), likes.T.tocsr()[np.array([0, 1])],
+    )
+
+    # all cached state must be rebuilt from the new version
+    assert model._item_norms is None and model._user_norms is None
+    assert model._YtY is None and model._XtX is None
+    assert not np.allclose(model.item_norms, old_item_norms)
+    assert not np.allclose(model.user_norms, old_user_norms)
+
+    # cached similarity results now use the new factors
+    ids, _ = model.similar_items(1, N=2)
+    assert ids[0] == 1
+
+
+def test_partial_fit_requires_fitted_model():
+    model = AlternatingLeastSquares(factors=8, use_gpu=False)
+    empty = csr_matrix((1, 1))
+    with pytest.raises(ValueError, match="hasn't been fit"):
+        model.partial_fit(np.array([0]), empty, np.array([0]), empty)
+
+
+def test_partial_fit_supports_empty_side():
+    likes, model = _fitted_partial_model()
+
+    # only users refreshed, no items in this batch
+    model.partial_fit(
+        np.array([0]), likes[np.array([0])],
+        np.array([], dtype=np.intp), csr_matrix((0, likes.shape[0])),
+    )
+    assert model.item_factors.shape == (likes.shape[1], 8)
+
+    # only items refreshed, no users in this batch
+    model.partial_fit(
+        np.array([], dtype=np.intp), csr_matrix((0, likes.shape[1])),
+        np.array([1]), likes.T.tocsr()[np.array([1])],
+    )
+    assert model.user_factors.shape == (likes.shape[0], 8)
+
