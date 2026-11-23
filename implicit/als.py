@@ -16,6 +16,10 @@ def AlternatingLeastSquares(
     calculate_training_loss=False,
     num_threads=0,
     random_state=None,
+    validation_metric="ndcg",
+    validation_K=10,
+    early_stopping_patience=None,
+    validate_every=1,
 ):
     """Alternating Least Squares
 
@@ -55,6 +59,19 @@ def AlternatingLeastSquares(
     random_state : int, np.random.RandomState or None, optional
         The random state for seeding the initial item and user factors.
         Default is None.
+    validation_metric : str, optional
+        Ranking metric to optimize when a validation set is passed to ``fit``.
+        One of "precision", "map", "ndcg" (the default) or "auc".
+    validation_K : int, optional
+        Number of recommendations per user used when evaluating the validation
+        set. Defaults to 10.
+    early_stopping_patience : int, optional
+        Number of consecutive validation rounds without improvement tolerated
+        before fitting stops. Defaults to None, which disables early stopping
+        while still restoring the best validated iteration.
+    validate_every : int, optional
+        Evaluate the validation set once every ``validate_every`` iterations.
+        Defaults to 1.
     """
     if use_gpu:
         return implicit.gpu.als.AlternatingLeastSquares(
@@ -65,6 +82,10 @@ def AlternatingLeastSquares(
             iterations=iterations,
             calculate_training_loss=calculate_training_loss,
             random_state=random_state,
+            validation_metric=validation_metric,
+            validation_K=validation_K,
+            early_stopping_patience=early_stopping_patience,
+            validate_every=validate_every,
         )
     return implicit.cpu.als.AlternatingLeastSquares(
         factors,
@@ -77,4 +98,8 @@ def AlternatingLeastSquares(
         calculate_training_loss,
         num_threads,
         random_state,
+        validation_metric=validation_metric,
+        validation_K=validation_K,
+        early_stopping_patience=early_stopping_patience,
+        validate_every=validate_every,
     )

@@ -1,4 +1,6 @@
+import os
 import pickle
+import tempfile
 import unittest
 
 import numpy as np
@@ -9,6 +11,8 @@ from scipy.sparse import coo_matrix, csr_matrix, random
 
 import implicit
 from implicit.als import AlternatingLeastSquares
+from implicit.early_stopping import EarlyStopping
+from implicit.evaluation import leave_k_out_split, ranking_metrics_at_k
 from implicit.gpu import HAS_CUDA
 
 # pylint: disable=consider-using-f-string
@@ -363,3 +367,246 @@ def test_calculate_loss_segfault():
 
     loss = implicit.cpu.als.calculate_loss(c_ui, user_factors, item_factors, regularization)
     assert loss > 0
+
+
+def _get_validation_data():
+    # block-structured preferences so that the validation metrics are non-trivial
+    rng = np.random.RandomState(0)
+    n_users, n_items = 200, 100
+    rows, cols = [], []
+    for userid in range(n_users):
+        block = userid % 5
+        liked = rng.choice(
+            np.arange(block * 20, (block + 1) * 20), size=8, replace=False
+        )
+        rows += [userid] * 8
+        cols += list(liked)
+    ratings = coo_matrix(
+        (np.ones(len(rows)), (rows, cols)), shape=(n_users, n_items)
+    ).tocsr()
+    return leave_k_out_split(ratings, K=1, random_state=42)
+
+
+@pytest.mark.parametrize("use_gpu", [True, False] if HAS_CUDA else [False])
+def test_validation_history_and_best_restore(use_gpu):
+    train, validation = _get_validation_data()
+
+    model = AlternatingLeastSquares(
+        factors=16,
+        iterations=10,
+        use_gpu=use_gpu,
+        random_state=23,
+        validate_every=2,
+    )
+    model.fit(train, show_progress=False, validation_user_items=validation)
+
+    # a record is kept for every scheduled validation round, with all metrics
+    assert [record["iteration"] for record in model.validation_history] == [1, 3, 5, 7, 9]
+    for record in model.validation_history:
+        assert set(record.keys()) == {"iteration", "precision", "map", "ndcg", "auc"}
+
+    # the reported best round must match the best recorded ndcg
+    best_record = max(model.validation_history, key=lambda r: r["ndcg"])
+    assert model.best_iteration == best_record["iteration"]
+    assert model.best_validation_metrics == {
+        key: value for key, value in best_record.items() if key != "iteration"
+    }
+
+    # the factors actually retained reproduce the best round's metrics
+    metrics = ranking_metrics_at_k(
+        model, train, validation, K=10, show_progress=False
+    )
+    assert metrics["ndcg"] == pytest.approx(model.best_validation_metrics["ndcg"], abs=1e-12)
+
+
+@pytest.mark.parametrize("use_gpu", [True, False] if HAS_CUDA else [False])
+def test_early_stopping_patience(use_gpu):
+    train, validation = _get_validation_data()
+
+    patience = 2
+    model = AlternatingLeastSquares(
+        factors=16,
+        iterations=100,
+        use_gpu=use_gpu,
+        random_state=23,
+        validate_every=1,
+        early_stopping_patience=patience,
+    )
+    model.fit(train, show_progress=False, validation_user_items=validation)
+
+    iterations = [record["iteration"] for record in model.validation_history]
+    # training must have stopped before the full iteration budget
+    assert iterations[-1] < 99
+    # the last `patience` validation rounds did not improve on the best score
+    best_score = max(record["ndcg"] for record in model.validation_history)
+    assert all(record["ndcg"] <= best_score for record in model.validation_history[-patience:])
+    assert model.best_iteration <= iterations[-1] - patience
+
+    # retained factors still reproduce the best metrics
+    metrics = ranking_metrics_at_k(
+        model, train, validation, K=10, show_progress=False
+    )
+    assert metrics["ndcg"] == pytest.approx(model.best_validation_metrics["ndcg"], abs=1e-12)
+
+
+@pytest.mark.parametrize("use_gpu", [True, False] if HAS_CUDA else [False])
+def test_validation_without_early_stopping_runs_full_schedule(use_gpu):
+    train, validation = _get_validation_data()
+
+    model = AlternatingLeastSquares(
+        factors=8,
+        iterations=6,
+        use_gpu=use_gpu,
+        random_state=23,
+        validate_every=1,
+        early_stopping_patience=None,
+    )
+    model.fit(train, show_progress=False, validation_user_items=validation)
+    assert [record["iteration"] for record in model.validation_history] == list(range(6))
+    assert model.best_iteration is not None
+
+
+def test_validation_invalid_arguments():
+    train, validation = _get_validation_data()
+
+    with pytest.raises(ValueError):
+        AlternatingLeastSquares(validation_metric="bogus").fit(
+            train, show_progress=False, validation_user_items=validation
+        )
+
+    wrong_shape = train.copy()
+    wrong_shape.resize((50, train.shape[1]))
+    with pytest.raises(ValueError):
+        AlternatingLeastSquares().fit(
+            train, show_progress=False, validation_user_items=wrong_shape
+        )
+
+    with pytest.raises(ValueError):
+        AlternatingLeastSquares(early_stopping_patience=0).fit(
+            train, show_progress=False, validation_user_items=validation
+        )
+
+    with pytest.raises(ValueError):
+        AlternatingLeastSquares(validate_every=0).fit(
+            train, show_progress=False, validation_user_items=validation
+        )
+
+
+@pytest.mark.parametrize("use_gpu", [True, False] if HAS_CUDA else [False])
+def test_validation_accepts_non_csr_matrix(use_gpu):
+    train, validation = _get_validation_data()
+    model = AlternatingLeastSquares(
+        factors=8, iterations=3, use_gpu=use_gpu, random_state=23
+    )
+    # a COO matrix is converted to CSR with a warning, just like the training input
+    with pytest.warns(implicit.utils.ParameterWarning):
+        model.fit(
+            train, show_progress=False, validation_user_items=validation.tocoo()
+        )
+    assert model.best_iteration is not None
+    assert len(model.validation_history) == 3
+
+
+def test_no_validation_keeps_legacy_behaviour():
+    train, _ = _get_validation_data()
+    model = AlternatingLeastSquares(
+        factors=8, iterations=3, use_gpu=False, random_state=23
+    )
+    model.fit(train, show_progress=False)
+    assert model.validation_history is None
+    assert model.best_iteration is None
+    assert model.best_validation_metrics is None
+
+
+def test_validation_state_round_trips_through_save():
+    from implicit.cpu.als import AlternatingLeastSquares as CPUALS
+
+    train, validation = _get_validation_data()
+    model = AlternatingLeastSquares(
+        factors=16,
+        iterations=15,
+        use_gpu=False,
+        random_state=23,
+        validate_every=2,
+        early_stopping_patience=2,
+    )
+    model.fit(train, show_progress=False, validation_user_items=validation)
+
+    ids_before, _ = model.recommend(np.arange(10), train[np.arange(10)])
+    similar_before = model.similar_items(0)[0]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "model.npz")
+        model.save(path)
+        reloaded = CPUALS.load(path)
+
+    # the full per-round report and the chosen round survive the round trip
+    assert reloaded.validation_history == model.validation_history
+    assert reloaded.best_iteration == model.best_iteration
+    assert reloaded.best_validation_metrics == model.best_validation_metrics
+    assert reloaded.early_stopping_patience == 2
+    assert reloaded.validate_every == 2
+
+    # the retained factors are byte-identical, so every inference path agrees
+    assert_array_equal(reloaded.user_factors, model.user_factors)
+    assert_array_equal(reloaded.item_factors, model.item_factors)
+    ids_after, _ = reloaded.recommend(np.arange(10), train[np.arange(10)])
+    assert_array_equal(ids_before, ids_after)
+    assert_array_equal(similar_before, reloaded.similar_items(0)[0])
+
+    # explanations computed from the restored factors remain self-consistent
+    top_rec = reloaded.recommend(0, train[0])[0][0]
+    score, contributions, _ = reloaded.explain(0, train, top_rec)
+    assert score == pytest.approx(sum(s for _, s in contributions), abs=1e-5)
+
+
+def test_legacy_model_without_validation_history_loads():
+    from implicit.cpu.als import AlternatingLeastSquares as CPUALS
+
+    train, _ = _get_validation_data()
+    model = AlternatingLeastSquares(
+        factors=8, iterations=2, use_gpu=False, random_state=1
+    )
+    model.fit(train, show_progress=False)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "legacy.npz")
+        model.save(path)
+        reloaded = CPUALS.load(path)
+
+    assert reloaded.validation_history is None
+    assert reloaded.best_iteration is None
+    assert reloaded.best_validation_metrics is None
+
+
+def test_restore_best_reinstates_exact_snapshot():
+    train, validation = _get_validation_data()
+
+    early = AlternatingLeastSquares(
+        factors=16, iterations=4, use_gpu=False, random_state=23
+    )
+    early.fit(train, show_progress=False)
+
+    stopping = EarlyStopping(early, train, validation, metric="ndcg", K=10)
+    stopping.step(3)
+    best_user_factors = early.user_factors.copy()
+    best_item_factors = early.item_factors.copy()
+
+    # keep training past the validated round so that the factors drift
+    later = AlternatingLeastSquares(
+        factors=16, iterations=20, use_gpu=False, random_state=23
+    )
+    later.user_factors = early.user_factors
+    later.item_factors = early.item_factors
+    later.fit(train, show_progress=False)
+    assert not np.array_equal(later.item_factors, best_item_factors)
+
+    stopping.model = later
+    stopping.restore_best()
+    assert_array_equal(later.user_factors, best_user_factors)
+    assert_array_equal(later.item_factors, best_item_factors)
+
+    metrics = ranking_metrics_at_k(
+        later, train, validation, K=10, show_progress=False
+    )
+    assert metrics["ndcg"] == pytest.approx(stopping.best_metrics["ndcg"], abs=1e-12)

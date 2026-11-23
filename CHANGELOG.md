@@ -1,3 +1,14 @@
+## Unreleased
+
+### New Features
+
+* ALS `fit` now accepts a `validation_user_items` hold-out matrix. The model is evaluated on it
+  every `validate_every` iterations using `ranking_metrics_at_k`, the per-round precision, map,
+  ndcg and auc values are kept in the new `validation_history` attribute, and the factors from
+  the best round (`best_iteration` / `best_validation_metrics`) are restored when fitting ends.
+  Set `early_stopping_patience` to stop training once the chosen `validation_metric` (default
+  ndcg) stops improving. The validation report is included in saved/loaded models.
+
 ## v0.5.0
 
 ### Breaking API Changes

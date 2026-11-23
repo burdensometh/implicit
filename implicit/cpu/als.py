@@ -10,6 +10,7 @@ import scipy
 import scipy.sparse
 from tqdm.auto import tqdm
 
+from ..early_stopping import EarlyStopping
 from ..utils import check_blas_config, check_csr, check_random_state, nonzeros
 from . import _als
 from .matrix_factorization_base import MatrixFactorizationBase
@@ -49,6 +50,20 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
     random_state : int, numpy.random.RandomState, np.random.Generator or None, optional
         The random state for seeding the initial item and user factors.
         Default is None.
+    validation_metric : str, optional
+        Ranking metric to optimize on a held-out validation set during fitting.
+        One of "precision", "map", "ndcg" or "auc" (the default). Only used when
+        ``validation_user_items`` is passed to ``fit``.
+    validation_K : int, optional
+        Number of recommendations per user to compute when evaluating the
+        validation set. Defaults to 10.
+    early_stopping_patience : int, optional
+        Number of consecutive validation rounds without improvement tolerated
+        before fitting stops. Defaults to None, which disables early stopping
+        while still selecting the best validated iteration.
+    validate_every : int, optional
+        Evaluate the validation set once every ``validate_every`` iterations.
+        Defaults to 1.
 
     Attributes
     ----------
@@ -56,6 +71,13 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
         Array of latent factors for each item in the training set
     user_factors : ndarray
         Array of latent factors for each user in the training set
+    validation_history : list[dict] or None
+        Metrics measured in every validation round of the last fit. Each entry
+        maps the iteration and the ranking metric names to their values.
+    best_iteration : int or None
+        The iteration whose factors scored best on the validation set.
+    best_validation_metrics : dict or None
+        The full set of validation metrics measured at ``best_iteration``.
     """
 
     def __init__(
@@ -70,6 +92,10 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
         calculate_training_loss=False,
         num_threads=0,
         random_state=None,
+        validation_metric="ndcg",
+        validation_K=10,
+        early_stopping_patience=None,
+        validate_every=1,
     ):
         super().__init__(num_threads=num_threads)
 
@@ -88,6 +114,17 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
         self.cg_steps = 3
         self.random_state = random_state
 
+        # validation / early stopping options
+        self.validation_metric = validation_metric
+        self.validation_K = validation_K
+        self.early_stopping_patience = early_stopping_patience
+        self.validate_every = validate_every
+
+        # results of the validation rounds from the last fit()
+        self.validation_history = None
+        self.best_iteration = None
+        self.best_validation_metrics = None
+
         # cache for item factors squared
         self._YtY = None
         # cache for user factors squared
@@ -95,7 +132,13 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
 
         check_blas_config()
 
-    def fit(self, user_items, show_progress=True, callback=None):
+    def fit(
+        self,
+        user_items,
+        show_progress=True,
+        callback=None,
+        validation_user_items=None,
+    ):
         """Factorizes the user_items matrix.
 
         After calling this method, the members 'user_factors' and 'item_factors' will be
@@ -111,6 +154,15 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
         Negative items can also be passed with a higher confidence value by passing a negative
         value, indicating that the user disliked the item.
 
+        When ``validation_user_items`` is provided, the model is evaluated on the held-out
+        interactions every ``validate_every`` iterations. The factors from the iteration with
+        the best ``validation_metric`` score are restored when fitting finishes, so that
+        continuing past the optimum (while the training loss keeps decreasing) cannot
+        degrade recommendations. If ``early_stopping_patience`` is set, fitting stops once
+        the validation score has failed to improve for that many rounds. The per-round
+        validation metrics are kept in ``validation_history``, and the selected iteration in
+        ``best_iteration`` / ``best_validation_metrics``.
+
         Parameters
         ----------
         user_items: csr_matrix
@@ -121,6 +173,10 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
             Whether to show a progress bar during fitting
         callback: Callable, optional
             Callable function on each epoch with such arguments as epoch, elapsed time and progress
+        validation_user_items : csr_matrix, optional
+            Held-out matrix of interactions to evaluate against. Must have the same shape as
+            ``user_items``. When set, ranking metrics are computed on this matrix at a fixed
+            interval and the best validated factors are restored at the end of fitting.
         """
         # initialize the random state
         random_state = check_random_state(self.random_state)
@@ -154,6 +210,24 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
         self._XtX = None
         loss = None
 
+        # reset the validation bookkeeping from any previous fit
+        self.validation_history = None
+        self.best_iteration = None
+        self.best_validation_metrics = None
+
+        early_stopping = None
+        if validation_user_items is not None:
+            early_stopping = EarlyStopping(
+                self,
+                Cui,
+                check_csr(validation_user_items),
+                metric=self.validation_metric,
+                K=self.validation_K,
+                patience=self.early_stopping_patience,
+                validate_every=self.validate_every,
+                num_threads=self.num_threads,
+            )
+
         solver = self.solver
 
         log.debug("Running %i ALS iterations", self.iterations)
@@ -177,6 +251,8 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
                 )
                 progress.update(1)
 
+                postfix = {}
+
                 if self.calculate_training_loss:
                     loss = _als.calculate_loss(
                         Cui,
@@ -185,10 +261,21 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
                         self.regularization,
                         num_threads=self.num_threads,
                     )
-                    progress.set_postfix({"loss": loss})
+                    postfix["loss"] = loss
 
                     if not show_progress:
                         log.info("loss %.4f", loss)
+
+                if early_stopping is not None and early_stopping.should_evaluate(iteration):
+                    stop = early_stopping.step(iteration)
+                    postfix["validation_" + self.validation_metric] = early_stopping.history[-1][
+                        self.validation_metric
+                    ]
+                else:
+                    stop = False
+
+                if postfix:
+                    progress.set_postfix(postfix)
 
                 # Backward compatibility
                 if not callback:
@@ -196,8 +283,34 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
                 if callback:
                     callback(iteration, time.time() - s, loss)
 
+                if stop:
+                    log.info(
+                        "Early stopping at iteration %i: no improvement in %s for %i "
+                        "validation rounds. Best iteration was %i.",
+                        iteration,
+                        self.validation_metric,
+                        self.early_stopping_patience,
+                        early_stopping.best_iteration,
+                    )
+                    break
+
         if self.calculate_training_loss:
             log.info("Final training loss %.4f", loss)
+
+        if early_stopping is not None:
+            # keep the full per-round report and restore the best validated factors
+            self.validation_history = early_stopping.history or None
+            self.best_iteration = early_stopping.best_iteration
+            self.best_validation_metrics = early_stopping.best_metrics
+            early_stopping.restore_best()
+
+            if self.best_iteration is not None:
+                log.info(
+                    "Using factors from iteration %i with validation %s=%.6f",
+                    self.best_iteration,
+                    self.validation_metric,
+                    early_stopping.best_score,
+                )
 
         self._check_fit_errors()
 
@@ -448,14 +561,47 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
             iterations=self.iterations,
             calculate_training_loss=self.calculate_training_loss,
             random_state=self.random_state,
+            validation_metric=self.validation_metric,
+            validation_K=self.validation_K,
+            early_stopping_patience=self.early_stopping_patience,
+            validate_every=self.validate_every,
         )
         if self.user_factors is not None:
             ret.user_factors = implicit.gpu.Matrix(self.user_factors)
         if self.item_factors is not None:
             ret.item_factors = implicit.gpu.Matrix(self.item_factors)
+        # carry over the validation report so the chosen iteration survives conversion
+        ret.validation_history = self.validation_history
+        ret.best_iteration = self.best_iteration
+        ret.best_validation_metrics = self.best_validation_metrics
+        return ret
+
+    @classmethod
+    def load(cls, fileobj_or_path):
+        """Loads a model previously written with :meth:`save`."""
+        from ..early_stopping import HISTORY_KEY_PREFIX, restore_validation_state
+
+        if isinstance(fileobj_or_path, str) and not fileobj_or_path.endswith(".npz"):
+            fileobj_or_path = fileobj_or_path + ".npz"
+
+        with np.load(fileobj_or_path, allow_pickle=False) as data:
+            ret = cls()
+            for k, v in data.items():
+                # validation history is reconstructed below from the raw arrays
+                if k.startswith(HISTORY_KEY_PREFIX):
+                    continue
+                if k == "dtype":
+                    v = np.dtype(str(v))
+                elif v.shape == ():
+                    v = v.item()
+                setattr(ret, k, v)
+            restore_validation_state(ret, data)
+
         return ret
 
     def save(self, fileobj_or_path):
+        from ..early_stopping import add_validation_state
+
         args = {
             "user_factors": self.user_factors,
             "item_factors": self.item_factors,
@@ -470,7 +616,13 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
             "dtype": self.dtype.name,
             "random_state": self.random_state,
             "alpha": self.alpha,
+            "validation_metric": self.validation_metric,
+            "validation_K": self.validation_K,
+            "validate_every": self.validate_every,
         }
+        if self.early_stopping_patience is not None:
+            args["early_stopping_patience"] = self.early_stopping_patience
+        add_validation_state(args, self)
         # filter out 'None' valued args, since we can't go np.load on
         # them without using pickle
         args = {k: v for k, v in args.items() if v is not None}

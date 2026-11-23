@@ -5,6 +5,7 @@ import numpy as np
 from tqdm.auto import tqdm
 
 import implicit.gpu
+from implicit.early_stopping import EarlyStopping
 from implicit.gpu.matrix_factorization_base import MatrixFactorizationBase, check_random_state
 from implicit.utils import check_csr
 
@@ -36,6 +37,20 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
     random_state : int, RandomState or None, optional
         The random state for seeding the initial item and user factors.
         Default is None.
+    validation_metric : str, optional
+        Ranking metric to optimize on a held-out validation set during fitting.
+        One of "precision", "map", "ndcg" or "auc" (the default). Only used when
+        ``validation_user_items`` is passed to ``fit``.
+    validation_K : int, optional
+        Number of recommendations per user to compute when evaluating the
+        validation set. Defaults to 10.
+    early_stopping_patience : int, optional
+        Number of consecutive validation rounds without improvement tolerated
+        before fitting stops. Defaults to None, which disables early stopping
+        while still selecting the best validated iteration.
+    validate_every : int, optional
+        Evaluate the validation set once every ``validate_every`` iterations.
+        Defaults to 1.
 
     Attributes
     ----------
@@ -43,6 +58,13 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
         Array of latent factors for each item in the training set
     user_factors : ndarray
         Array of latent factors for each user in the training set
+    validation_history : list[dict] or None
+        Metrics measured in every validation round of the last fit. Each entry
+        maps the iteration and the ranking metric names to their values.
+    best_iteration : int or None
+        The iteration whose factors scored best on the validation set.
+    best_validation_metrics : dict or None
+        The full set of validation metrics measured at ``best_iteration``.
     """
 
     def __init__(
@@ -54,6 +76,10 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
         iterations=15,
         calculate_training_loss=False,
         random_state=None,
+        validation_metric="ndcg",
+        validation_K=10,
+        early_stopping_patience=None,
+        validate_every=1,
     ):
         if not implicit.gpu.HAS_RMM:
             raise ValueError("RMM isn't installed, can't train on GPU.")
@@ -76,12 +102,29 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
         self.random_state = random_state
         self.cg_steps = 3
 
+        # validation / early stopping options
+        self.validation_metric = validation_metric
+        self.validation_K = validation_K
+        self.early_stopping_patience = early_stopping_patience
+        self.validate_every = validate_every
+
+        # results of the validation rounds from the last fit()
+        self.validation_history = None
+        self.best_iteration = None
+        self.best_validation_metrics = None
+
         # cached access to properties
         self._solver = None
         self._YtY = None
         self._XtX = None
 
-    def fit(self, user_items, show_progress=True, callback=None):
+    def fit(
+        self,
+        user_items,
+        show_progress=True,
+        callback=None,
+        validation_user_items=None,
+    ):
         """Factorizes the user_items matrix.
 
         After calling this method, the members 'user_factors' and 'item_factors' will be
@@ -97,6 +140,15 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
         Negative items can also be passed with a higher confidence value by passing a negative
         value, indicating that the user disliked the item.
 
+        When ``validation_user_items`` is provided, the model is evaluated on the held-out
+        interactions every ``validate_every`` iterations. The factors from the iteration with
+        the best ``validation_metric`` score are restored when fitting finishes, so that
+        continuing past the optimum (while the training loss keeps decreasing) cannot
+        degrade recommendations. If ``early_stopping_patience`` is set, fitting stops once
+        the validation score has failed to improve for that many rounds. The per-round
+        validation metrics are kept in ``validation_history``, and the selected iteration in
+        ``best_iteration`` / ``best_validation_metrics``.
+
         Parameters
         ----------
         user_items: csr_matrix
@@ -107,6 +159,10 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
             Whether to show a progress bar during fitting
         callback: Callable, optional
             Callable function on each epoch with such arguments as epoch, elapsed time and progress
+        validation_user_items : csr_matrix, optional
+            Held-out matrix of interactions to evaluate against. Must have the same shape as
+            ``user_items``. When set, ranking metrics are computed on this matrix at a fixed
+            interval and the best validated factors are restored at the end of fitting.
         """
         # initialize the random state
         random_state = check_random_state(self.random_state)
@@ -145,11 +201,32 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
         self._item_norms_host = self._user_norms_host = None
         self._YtY = self._XtX = None
 
+        # keep the host-side CSR matrices around: the validation code ranks users
+        # through model.recommend, which expects scipy (not GPU) sparse matrices
+        train_csr = Cui
+
         Ciu = implicit.gpu.CSRMatrix(Ciu)
         Cui = implicit.gpu.CSRMatrix(Cui)
         X = self.user_factors
         Y = self.item_factors
         loss = None
+
+        # reset the validation bookkeeping from any previous fit
+        self.validation_history = None
+        self.best_iteration = None
+        self.best_validation_metrics = None
+
+        early_stopping = None
+        if validation_user_items is not None:
+            early_stopping = EarlyStopping(
+                self,
+                train_csr,
+                check_csr(validation_user_items),
+                metric=self.validation_metric,
+                K=self.validation_K,
+                patience=self.early_stopping_patience,
+                validate_every=self.validate_every,
+            )
 
         _YtY = implicit.gpu.Matrix.zeros(self.factors, self.factors)
         _XtX = implicit.gpu.Matrix.zeros(self.factors, self.factors)
@@ -165,12 +242,25 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
                 self.solver.least_squares(Ciu, Y, _XtX, X, self.cg_steps)
                 progress.update(1)
 
+                postfix = {}
+
                 if self.calculate_training_loss:
                     loss = self.solver.calculate_loss(Cui, X, Y, self.regularization)
-                    progress.set_postfix({"loss": loss})
+                    postfix["loss"] = loss
 
                     if not show_progress:
                         log.info("loss %.4f", loss)
+
+                if early_stopping is not None and early_stopping.should_evaluate(iteration):
+                    stop = early_stopping.step(iteration)
+                    postfix["validation_" + self.validation_metric] = early_stopping.history[-1][
+                        self.validation_metric
+                    ]
+                else:
+                    stop = False
+
+                if postfix:
+                    progress.set_postfix(postfix)
 
                 # Backward compatibility
                 if not callback:
@@ -178,8 +268,34 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
                 if callback:
                     callback(iteration, time.time() - s, loss)
 
+                if stop:
+                    log.info(
+                        "Early stopping at iteration %i: no improvement in %s for %i "
+                        "validation rounds. Best iteration was %i.",
+                        iteration,
+                        self.validation_metric,
+                        self.early_stopping_patience,
+                        early_stopping.best_iteration,
+                    )
+                    break
+
         if self.calculate_training_loss:
             log.info("Final training loss %.4f", loss)
+
+        if early_stopping is not None:
+            # keep the full per-round report and restore the best validated factors
+            self.validation_history = early_stopping.history or None
+            self.best_iteration = early_stopping.best_iteration
+            self.best_validation_metrics = early_stopping.best_metrics
+            early_stopping.restore_best()
+
+            if self.best_iteration is not None:
+                log.info(
+                    "Using factors from iteration %i with validation %s=%.6f",
+                    self.best_iteration,
+                    self.validation_metric,
+                    early_stopping.best_score,
+                )
 
     def recalculate_user(self, userid, user_items):
         if self.alpha != 1.0:
@@ -307,9 +423,17 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
             iterations=self.iterations,
             calculate_training_loss=self.calculate_training_loss,
             random_state=self.random_state,
+            validation_metric=self.validation_metric,
+            validation_K=self.validation_K,
+            early_stopping_patience=self.early_stopping_patience,
+            validate_every=self.validate_every,
         )
         ret.user_factors = self.user_factors.to_numpy() if self.user_factors is not None else None
         ret.item_factors = self.item_factors.to_numpy() if self.item_factors is not None else None
+        # carry over the validation report so the chosen iteration survives conversion
+        ret.validation_history = self.validation_history
+        ret.best_iteration = self.best_iteration
+        ret.best_validation_metrics = self.best_validation_metrics
         return ret
 
     def __getstate__(self):
