@@ -172,6 +172,10 @@ class BayesianPersonalizedRanking(MatrixFactorizationBase):
 
             self.user_factors[:, self.factors] = 1.0
 
+        # a refit against a catalog with new keys is larger than the old factors
+        self._grow_factors_for_fit(users, items)
+        self.user_factors[:, self.factors] = 1.0
+
         # invalidate cached norms
         self._user_norms = self._item_norms = None
 
@@ -237,6 +241,7 @@ class BayesianPersonalizedRanking(MatrixFactorizationBase):
             dtype=self.dtype.name,
             random_state=self.random_state
         )
+        args = self._save_id_maps(args)
 
         # filter out 'None' valued args, since we can't go np.load on
         # them without using pickle

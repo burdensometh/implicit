@@ -174,4 +174,6 @@ class BayesianPersonalizedRanking(MatrixFactorizationBase):
         )
         ret.user_factors = self.user_factors.to_numpy() if self.user_factors is not None else None
         ret.item_factors = self.item_factors.to_numpy() if self.item_factors is not None else None
+        ret.user_id_map = self.user_id_map
+        ret.item_id_map = self.item_id_map
         return ret

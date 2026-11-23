@@ -138,6 +138,9 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
             )
             self.item_factors = self.item_factors.astype(self.dtype)
 
+        # a refit against a catalog with new keys is larger than the old factors
+        self._grow_factors_for_fit(users, items)
+
         log.debug("Initialized factors in %s", time.time() - s)
 
         # invalidate cached norms and squared factors
@@ -222,6 +225,10 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
         user_items : csr_matrix
             Sparse matrix containing the liked items for each user
         """
+        self._check_positional_update_allowed("user")
+        return self._partial_fit_users(userids, user_items)
+
+    def _partial_fit_users(self, userids, user_items):
         if len(userids) != user_items.shape[0]:
             raise ValueError("user_items must contain 1 row for every user in userids")
 
@@ -231,9 +238,11 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
         # ensure that we have enough storage for any new users
         users, factors = self.user_factors.shape
         max_userid = max(userids)
+        self._check_positional_growth("user", max_userid)
         if max_userid >= users:
             # TODO: grow exponentially ?
             self.user_factors.resize(max_userid + 1, factors)
+            self._sync_positional_id_map("user", self.user_factors.shape[0], max_userid)
 
         self.user_factors.assign_rows(userids, user_factors)
 
@@ -257,6 +266,10 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
         item_users : csr_matrix
             Sparse matrix containing the liked users for each item in itemids
         """
+        self._check_positional_update_allowed("item")
+        return self._partial_fit_items(itemids, item_users)
+
+    def _partial_fit_items(self, itemids, item_users):
         if len(itemids) != item_users.shape[0]:
             raise ValueError("item_users must contain 1 row for every user in itemids")
 
@@ -266,9 +279,11 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
         # ensure that we have enough storage for any new items
         items, factors = self.item_factors.shape
         max_itemid = max(itemids)
+        self._check_positional_growth("item", max_itemid)
         if max_itemid >= items:
             # TODO: grow exponentially ?
             self.item_factors.resize(max_itemid + 1, factors)
+            self._sync_positional_id_map("item", self.item_factors.shape[0], max_itemid)
 
         # update the stored factors with the newly calculated values
         self.item_factors.assign_rows(itemids, item_factors)
@@ -310,6 +325,8 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
         )
         ret.user_factors = self.user_factors.to_numpy() if self.user_factors is not None else None
         ret.item_factors = self.item_factors.to_numpy() if self.item_factors is not None else None
+        ret.user_id_map = self.user_id_map
+        ret.item_id_map = self.item_id_map
         return ret
 
     def __getstate__(self):

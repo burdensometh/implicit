@@ -431,7 +431,13 @@ def ranking_metrics_at_k(model, train_user_items, test_user_items, int K=10,
 
     while start_idx < len(to_generate):
         batch = to_generate[start_idx: start_idx + batch_size]
-        ids, _ = model.recommend(batch, train_user_items[np.asarray(batch)], N=K)
+        # evaluation works entirely in positional index space: keyed models expose
+        # _recommend_positions, and models without a key map return positions anyway
+        recommend = getattr(model, "_recommend_positions", None)
+        if recommend is None:
+            ids, _ = model.recommend(batch, train_user_items[np.asarray(batch)], N=K)
+        else:
+            ids, _ = recommend(batch, train_user_items[np.asarray(batch)], N=K)
         start_idx += batch_size
 
         with nogil:

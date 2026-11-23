@@ -5,13 +5,13 @@ import numpy as np
 from scipy.sparse import csr_matrix
 
 import implicit.gpu
-from implicit.recommender_base import RecommenderBase
+from implicit.recommender_base import IdMapDelegatingMixin, RecommenderBase
 from implicit.utils import _batch_call, _filter_items_from_results, augment_inner_product_matrix
 
 log = logging.getLogger("implicit")
 
 
-class NMSLibModel(RecommenderBase):
+class NMSLibModel(IdMapDelegatingMixin, RecommenderBase):
     """Speeds up inference calls to MatrixFactorization models by using
     `NMSLib <https://github.com/nmslib/nmslib>`_ to create approximate nearest neighbours
     indices of the latent factors.
@@ -113,8 +113,25 @@ class NMSLibModel(RecommenderBase):
     def similar_items(
         self, itemid, N=10, recalculate_item=False, item_users=None, filter_items=None, items=None
     ):
+        position_itemid = self._resolve_item_ids(itemid)
+        position_filter = None if filter_items is None else self._resolve_item_ids(filter_items)
+        position_items = None if items is None else self._resolve_item_ids(items)
+
+        ids, scores = self._similar_items_positions(
+            position_itemid,
+            N=N,
+            recalculate_item=recalculate_item,
+            item_users=item_users,
+            filter_items=position_filter,
+            items=position_items,
+        )
+        return self._map_item_ids(ids), scores
+
+    def _similar_items_positions(
+        self, itemid, N=10, recalculate_item=False, item_users=None, filter_items=None, items=None
+    ):
         if not self.approximate_similar_items:
-            return self.model.similar_items(
+            return self.model._similar_items_positions(  # pylint: disable=protected-access
                 itemid,
                 N,
                 item_users=item_users,
@@ -163,6 +180,32 @@ class NMSLibModel(RecommenderBase):
         recalculate_user=False,
         items=None,
     ):
+        position_userids = self._resolve_user_ids(userid)
+        position_items = None if items is None else self._resolve_item_ids(items)
+        position_filter = None if filter_items is None else self._resolve_item_ids(filter_items)
+        user_items = self._resolve_user_items(user_items)
+
+        ids, scores = self._recommend_positions(
+            position_userids,
+            user_items,
+            N=N,
+            filter_already_liked_items=filter_already_liked_items,
+            filter_items=position_filter,
+            recalculate_user=recalculate_user,
+            items=position_items,
+        )
+        return self._map_item_ids(ids), scores
+
+    def _recommend_positions(
+        self,
+        userid,
+        user_items,
+        N=10,
+        filter_already_liked_items=True,
+        filter_items=None,
+        recalculate_user=False,
+        items=None,
+    ):
         if (filter_already_liked_items or recalculate_user) and not isinstance(
             user_items, csr_matrix
         ):
@@ -172,7 +215,7 @@ class NMSLibModel(RecommenderBase):
             raise NotImplementedError("using a 'items' list with ANN search isn't supported")
 
         if not self.approximate_recommend:
-            return self.model.recommend(
+            return self.model._recommend_positions(  # pylint: disable=protected-access
                 userid,
                 user_items,
                 N=N,
@@ -185,7 +228,7 @@ class NMSLibModel(RecommenderBase):
         # batch computation is hard here, fallback to looping over items
         if not np.isscalar(userid):
             return _batch_call(
-                self.recommend,
+                self._recommend_positions,
                 userid,
                 user_items=user_items,
                 N=N,

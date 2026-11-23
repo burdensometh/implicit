@@ -26,6 +26,11 @@ class ItemItemRecommender(RecommenderBase):
         self.K = K
         self.num_threads = num_threads
         self.scorer = None
+        self.user_id_map = None
+        self.item_id_map = None
+
+    def _num_items(self):
+        return None if self.similarity is None else self.similarity.shape[0]
 
     def fit(self, weighted, show_progress=True, callback=None):
         """Computes and stores the similarity matrix"""
@@ -53,12 +58,41 @@ class ItemItemRecommender(RecommenderBase):
         if not isinstance(user_items, csr_matrix):
             raise ValueError("user_items needs to be a CSR sparse matrix")
 
-        if not np.isscalar(userid):
-            if user_items.shape[0] != len(userid):
+        user_items = self._resolve_user_items(user_items)
+        position_userids = self._resolve_user_ids(userid)
+        if filter_items is not None:
+            filter_items = self._resolve_item_ids(filter_items)
+        if items is not None:
+            items = self._resolve_item_ids(items)
+
+        if not np.isscalar(position_userids):
+            if user_items.shape[0] != len(position_userids):
                 raise ValueError("user_items must contain 1 row for every user in userids")
 
+        ids, scores = self._recommend_positions(
+            position_userids,
+            user_items,
+            N=N,
+            filter_already_liked_items=filter_already_liked_items,
+            filter_items=filter_items,
+            recalculate_user=recalculate_user,
+            items=items,
+        )
+        return self._map_item_ids(ids), scores
+
+    def _recommend_positions(
+        self,
+        userid,
+        user_items,
+        N=10,
+        filter_already_liked_items=True,
+        filter_items=None,
+        recalculate_user=False,
+        items=None,
+    ):
+        if not np.isscalar(userid):
             return _batch_call(
-                self.recommend,
+                self._recommend_positions,
                 userid,
                 user_items=user_items,
                 N=N,
@@ -73,6 +107,7 @@ class ItemItemRecommender(RecommenderBase):
             raise ValueError("Can't specify both filter_items and items")
 
         if filter_items is not None:
+            filter_items = np.asarray(filter_items)
             N += len(filter_items)
         elif items is not None:
             items = np.array(items)
@@ -114,18 +149,38 @@ class ItemItemRecommender(RecommenderBase):
         if recalculate_item:
             raise NotImplementedError("Recalculate_item isn't implemented")
 
-        if not np.isscalar(itemid):
-            return _batch_call(
-                self.similar_items,
-                itemid,
+        position_itemid = self._resolve_item_ids(itemid)
+        if filter_items is not None:
+            filter_items = self._resolve_item_ids(filter_items)
+        if items is not None:
+            items = self._resolve_item_ids(items)
+
+        if not np.isscalar(position_itemid):
+            ids, scores = _batch_call(
+                self._similar_items_positions,
+                position_itemid,
                 N=N,
                 score_dtype=np.float64,
                 filter_items=filter_items,
                 items=items,
             )
+            return self._map_item_ids(ids), scores
 
+        ids, scores = self._similar_items_positions(
+            position_itemid, N=N, filter_items=filter_items, items=items
+        )
+        return self._map_item_ids(ids), scores
+
+    def _similar_items_positions(
+        self, itemid, N=10, recalculate_item=False, item_users=None, filter_items=None, items=None
+    ):
         if filter_items is not None and items is not None:
             raise ValueError("Can't specify both filter_items and items")
+
+        if filter_items is not None:
+            filter_items = np.asarray(filter_items)
+        if items is not None:
+            items = np.asarray(items)
 
         if itemid >= self.similarity.shape[0]:
             return np.array([]), np.array([])
@@ -170,6 +225,7 @@ class ItemItemRecommender(RecommenderBase):
             args.update(
                 {"shape": m.shape, "data": m.data, "indptr": m.indptr, "indices": m.indices}
             )
+        args = self._save_id_maps(args)
         np.savez(fileobj_or_path, **args)
 
     @classmethod
@@ -177,6 +233,8 @@ class ItemItemRecommender(RecommenderBase):
         # numpy.save automatically appends a npz suffic, numpy.load doesn't apparently
         if isinstance(fileobj_or_path, str) and not fileobj_or_path.endswith(".npz"):
             fileobj_or_path = fileobj_or_path + ".npz"
+
+        from .id_map import IdMap
 
         with np.load(fileobj_or_path, allow_pickle=False) as data:
             ret = cls()
@@ -187,6 +245,9 @@ class ItemItemRecommender(RecommenderBase):
                 ret.similarity = similarity
                 ret.scorer = NearestNeighboursScorer(similarity)
             ret.K = data["K"]
+            for kind in ("user", "item"):
+                if f"{kind}_id_map" in data:
+                    setattr(ret, f"{kind}_id_map", IdMap.from_json(data[f"{kind}_id_map"]))
             return ret
 
 

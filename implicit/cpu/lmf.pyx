@@ -164,6 +164,12 @@ class LogisticMatrixFactorization(MatrixFactorizationBase):
             # set factors to all zeros for users without any ratings
             self.user_factors[user_counts == 0] = np.zeros(self.factors + 2)
 
+        # a refit against a catalog with new keys is larger than the old factors
+        self._grow_factors_for_fit(users, items)
+        # the bias columns are reset every epoch, but make the appended rows valid now too
+        self.user_factors[:, -2] = 1.0
+        self.item_factors[:, -1] = 1.0
+
         # For Adagrad update
         user_vec_deriv_sum = np.zeros((users, self.factors + 2)).astype(np.float32)
         item_vec_deriv_sum = np.zeros((items, self.factors + 2)).astype(np.float32)
@@ -210,6 +216,7 @@ class LogisticMatrixFactorization(MatrixFactorizationBase):
             iterations=self.iterations,
             dtype=self.dtype.name,
             random_state=self.random_state)
+        args = self._save_id_maps(args)
 
         # filter out 'None' valued args, since we can't go np.load on
         # them without using pickle

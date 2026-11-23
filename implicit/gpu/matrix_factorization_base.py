@@ -25,6 +25,8 @@ class MatrixFactorizationBase(RecommenderBase):
     def __init__(self):
         self.item_factors = None
         self.user_factors = None
+        self.user_id_map = None
+        self.item_id_map = None
         self._item_norms = None
         self._user_norms = None
         self._user_norms_host = None
@@ -41,6 +43,33 @@ class MatrixFactorizationBase(RecommenderBase):
         recalculate_user=False,
         items=None,
     ):
+        position_userids = self._resolve_user_ids(userid)
+        position_items = None if items is None else self._resolve_item_ids(items)
+        position_filter = None if filter_items is None else self._resolve_item_ids(filter_items)
+        user_items = self._resolve_user_items(user_items)
+
+        ids, scores = self._recommend_positions(
+            position_userids,
+            user_items,
+            N=N,
+            filter_already_liked_items=filter_already_liked_items,
+            filter_items=position_filter,
+            recalculate_user=recalculate_user,
+            items=position_items,
+        )
+        return self._map_item_ids(ids), scores
+
+    def _recommend_positions(
+        self,
+        userid,
+        user_items,
+        N=10,
+        filter_already_liked_items=True,
+        filter_items=None,
+        recalculate_user=False,
+        items=None,
+    ):
+        """``recommend`` on raw positional indices, used by evaluation helpers."""
         if filter_already_liked_items or recalculate_user:
             if not isinstance(user_items, csr_matrix):
                 raise ValueError("user_items needs to be a CSR sparse matrix")
@@ -56,10 +85,10 @@ class MatrixFactorizationBase(RecommenderBase):
         item_factors = self.item_factors
         if items is not None:
             N = min(N, len(items))
-            if filter_items:
+            if filter_items is not None:
                 raise ValueError("Can't set both items and filter_items in recommend call")
 
-            items = np.array(items)
+            items = np.asarray(items)
             items.sort()
             item_factors = item_factors[items]
 
@@ -123,13 +152,17 @@ class MatrixFactorizationBase(RecommenderBase):
         return self._knn
 
     def similar_users(self, userid, N=10, filter_users=None, users=None):
+        userid = self._resolve_user_ids(userid)
+        if filter_users is not None:
+            filter_users = self._resolve_user_ids(filter_users)
+
         norms = self.user_norms
         user_factors = self.user_factors
         if users is not None:
-            if filter_users:
+            if filter_users is not None:
                 raise ValueError("Can't set both users and filter_users in similar_users call")
 
-            users = np.array(users)
+            users = np.asarray(self._resolve_user_ids(users))
             user_factors = user_factors[users]
 
             # TODO: we should be able to do this all on the GPU
@@ -155,20 +188,39 @@ class MatrixFactorizationBase(RecommenderBase):
             scores /= user_norms
         else:
             scores /= user_norms[:, None]
-        return ids, scores
+        return self._map_user_ids(ids), scores
 
     similar_users.__doc__ = RecommenderBase.similar_users.__doc__
 
     def similar_items(
         self, itemid, N=10, recalculate_item=False, item_users=None, filter_items=None, items=None
     ):
+        itemid = self._resolve_item_ids(itemid)
+        if filter_items is not None:
+            filter_items = self._resolve_item_ids(filter_items)
+        if items is not None:
+            items = self._resolve_item_ids(items)
+
+        ids, scores = self._similar_items_positions(
+            itemid,
+            N=N,
+            recalculate_item=recalculate_item,
+            item_users=item_users,
+            filter_items=filter_items,
+            items=items,
+        )
+        return self._map_item_ids(ids), scores
+
+    def _similar_items_positions(
+        self, itemid, N=10, recalculate_item=False, item_users=None, filter_items=None, items=None
+    ):
         item_factors = self.item_factors
         norms = self.item_norms
         if items is not None:
-            if filter_items:
+            if filter_items is not None:
                 raise ValueError("Can't set both items and filter_items in similar_items call")
 
-            items = np.array(items)
+            items = np.asarray(items)
 
             # TODO: we should be able to do this all on the GPU
             norms = implicit.gpu.Matrix(self._item_norms_host[items].reshape(1, len(items)))

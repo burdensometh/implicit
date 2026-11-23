@@ -1,3 +1,17 @@
+## Unreleased
+
+### New Features
+
+* Add stable business-key mappings (`implicit.id_map.IdMap`,
+  `implicit.id_map.build_interaction_matrix`) so sparse interaction matrices and incremental
+  model updates can be addressed by SKU/user key instead of fragile integer positions. Existing
+  keys keep their index, unseen keys are appended, and the maps are persisted with the model.
+* Add `fit_from_keys`, `partial_fit_users_by_key` and `partial_fit_items_by_key` to the
+  recommender models; `recommend`/`similar_items`/`similar_users` accept and return business
+  keys when a model has key maps. Duplicate input keys are handled explicitly
+  (`on_duplicate="error" | "first" | "last"` for updates, `"sum" | "max" | "first" | "last" |
+  "error"` for interaction matrices).
+
 ## v0.5.0
 
 ### Breaking API Changes

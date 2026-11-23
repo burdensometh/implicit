@@ -70,6 +70,41 @@ last.fm dataset](https://github.com/benfred/implicit/blob/master/examples/lastfm
 
 For more information see the [documentation](https://benfred.github.io/implicit/).
 
+#### Stable business keys
+
+Models index users and items by row/column position in the sparse matrix they were
+trained on. If a catalog is re-sorted or new items are inserted, those positions shift -
+and an incremental update addressed by integer index can silently write a new item's
+behaviour into an existing user's row. `implicit.id_map` adds a stable, append-only
+mapping from business keys (SKUs, user ids, UUIDs) to indices:
+existing keys always keep their index, new keys are appended.
+
+```python
+from implicit.als import AlternatingLeastSquares
+from implicit.id_map import build_interaction_matrix
+
+# build a matrix from business keys, reusing the maps on every weekly refresh
+matrix, user_id_map, item_id_map = build_interaction_matrix(users, items)
+
+model = AlternatingLeastSquares()
+model.fit_from_keys(users, items)          # fits and stores the maps on the model
+
+# address everything by business key afterwards
+ids, scores = model.recommend("user-42", user_items_row)
+
+# new SKUs / users are appended; existing rows are never moved
+model.partial_fit_items_by_key(["sku-new"], sku_user_row)
+model.partial_fit_users_by_key(["user-new"], user_item_row)
+```
+
+The maps are saved with the model and restored on load, so keyed partial training and
+recommendation keep working after a save/reopen. Duplicate keys are handled explicitly:
+`partial_fit_*_by_key(..., on_duplicate="error" | "first" | "last")` for update calls, and
+`build_interaction_matrix(..., on_duplicate="sum" | "max" | "first" | "last" | "error")`
+for repeated (user, item) pairs. Positional `partial_fit_users` / `partial_fit_items`
+calls are rejected on a keyed model, since a raw index would write into whichever entity
+happens to occupy that row.
+
 #### Articles about Implicit
 
 These blog posts describe the algorithms that power this library:

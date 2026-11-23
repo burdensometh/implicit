@@ -146,6 +146,10 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
         if self.item_factors is None:
             self.item_factors = random_state.random((items, self.factors), dtype=self.dtype) * 0.01
 
+        # a refit against a catalog with new keys is larger than the old factors: keep the
+        # existing rows and append zero rows that the solver will fill in
+        self._grow_factors_for_fit(users, items)
+
         log.debug("Initialized factors in %s", time.time() - s)
 
         # invalidate cached norms and squared factors
@@ -282,6 +286,11 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
         avoid a full retraining when new users appear - or the liked
         items for an existing user change.
 
+        ``userids`` are positional row indices. On a model keyed by business keys
+        (``user_id_map`` is set and not just ``0..n-1``) this raises - use
+        :meth:`~implicit.recommender_base.RecommenderBase.partial_fit_users_by_key`
+        instead so the key, not the position, selects the row.
+
         Parameters
         ----------
         userids : array_like
@@ -290,8 +299,14 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
             Sparse matrix containing the liked items for each user. Each row in this
             matrix corresponds to a row in userids.
         """
+        self._check_positional_update_allowed("user")
+        return self._partial_fit_users(userids, user_items)
+
+    def _partial_fit_users(self, userids, user_items):
         if len(userids) != user_items.shape[0]:
             raise ValueError("user_items must contain 1 row for every user in userids")
+
+        self._validate_user_items_columns(user_items, "user_items")
 
         # recalculate factors for each user in the input
         user_factors = self.recalculate_user(userids, user_items)
@@ -299,10 +314,12 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
         # ensure that we have enough storage for any new users
         users, factors = self.user_factors.shape
         max_userid = max(userids)
+        self._check_positional_growth("user", max_userid)
         if max_userid >= users:
             self.user_factors = np.concatenate(
                 [self.user_factors, np.zeros((max_userid - users + 1, factors), dtype=self.dtype)]
             )
+            self._sync_positional_id_map("user", self.user_factors.shape[0], max_userid)
 
         # update the stored factors with the newly calculated values
         self.user_factors[userids] = user_factors
@@ -320,6 +337,11 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
         avoid a full retraining when new users appear - or the liked
         users for an existing item change.
 
+        ``itemids`` are positional row indices. On a model keyed by business keys
+        (``item_id_map`` is set and not just ``0..n-1``) this raises - use
+        :meth:`~implicit.recommender_base.RecommenderBase.partial_fit_items_by_key`
+        instead so the key, not the position, selects the row.
+
         Parameters
         ----------
         itemids : array_like
@@ -327,8 +349,14 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
         item_users : csr_matrix
             Sparse matrix containing the liked users for each item in itemids
         """
+        self._check_positional_update_allowed("item")
+        return self._partial_fit_items(itemids, item_users)
+
+    def _partial_fit_items(self, itemids, item_users):
         if len(itemids) != item_users.shape[0]:
             raise ValueError("item_users must contain 1 row for every user in itemids")
+
+        self._validate_user_items_columns(item_users, "item_users")
 
         # recalculate factors for each item in the input
         item_factors = self.recalculate_item(itemids, item_users)
@@ -336,10 +364,12 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
         # ensure that we have enough storage for any new items
         items, factors = self.item_factors.shape
         max_itemid = max(itemids)
+        self._check_positional_growth("item", max_itemid)
         if max_itemid >= items:
             self.item_factors = np.concatenate(
                 [self.item_factors, np.zeros((max_itemid - items + 1, factors), dtype=self.dtype)]
             )
+            self._sync_positional_id_map("item", self.item_factors.shape[0], max_itemid)
 
         # update the stored factors with the newly calculated values
         self.item_factors[itemids] = item_factors
@@ -371,13 +401,17 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
         total_score : float
             The total predicted score for this user/item pair
         top_contributions : list
-            A list of the top N (itemid, score) contributions for this user/item pair
+            A list of the top N (itemid, score) contributions for this user/item pair.
+            Item ids are business keys when the model has an ``item_id_map``.
         user_weights : ndarray
             A factorized representation of the user. Passing this in to
             future 'explain' calls will lead to noticeable speedups
         """
 
+        userid = self._resolve_user_ids(userid)
+        itemid = self._resolve_item_ids(itemid)
         user_items = check_csr(user_items)
+        self._validate_user_items_columns(user_items, "user_items")
         if self.alpha != 1.0:
             user_items = self.alpha * user_items
 
@@ -413,6 +447,10 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
 
         items = (heapq.heappop(h) for i in range(len(h)))
         top_contributions = list((i, s) for s, i in items)[::-1]
+        if self.item_id_map is not None and len(self.item_id_map):
+            top_contributions = [
+                (self.item_id_map.key(int(i)), s) for i, s in top_contributions
+            ]
         return total_score, top_contributions, user_weights
 
     @property
@@ -453,6 +491,8 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
             ret.user_factors = implicit.gpu.Matrix(self.user_factors)
         if self.item_factors is not None:
             ret.item_factors = implicit.gpu.Matrix(self.item_factors)
+        ret.user_id_map = self.user_id_map
+        ret.item_id_map = self.item_id_map
         return ret
 
     def save(self, fileobj_or_path):
@@ -471,6 +511,7 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
             "random_state": self.random_state,
             "alpha": self.alpha,
         }
+        args = self._save_id_maps(args)
         # filter out 'None' valued args, since we can't go np.load on
         # them without using pickle
         args = {k: v for k, v in args.items() if v is not None}
