@@ -2,12 +2,137 @@
 
 import warnings
 from abc import ABCMeta, abstractmethod
+from collections import namedtuple
 
 import numpy as np
 
 
 class ModelFitError(Exception):
     pass
+
+
+# Reasons why a piece of feedback or a target item does not participate in an
+# explanation. Keeping these as string constants avoids typos and makes it
+# easier to filter on the reason in downstream code.
+EXCLUDED_NEGATIVE_FEEDBACK = "negative_feedback"
+EXCLUDED_ZERO_CONTRIBUTION = "zero_contribution"
+EXCLUDED_FILTERED_TARGET = "filtered_target"
+
+
+# A single feedback entry (or target item) that was kept out of the score
+# decomposition, together with the reason why.
+Exclusion = namedtuple("Exclusion", ["itemid", "confidence", "reason"])
+
+
+class Explanation(
+    namedtuple(
+        "Explanation",
+        [
+            "total_score",
+            "selected_contributions",
+            "other_contributions",
+            "excluded",
+            "user_factors_source",
+            "feedback",
+            "stored_user_score",
+            "user_weights",
+        ],
+    )
+):
+    """Result of explaining a user/item score.
+
+    Behaves like the legacy ``(total_score, top_contributions, user_weights)``
+    tuple returned by :meth:`RecommenderBase.explain`, while also exposing the
+    full decomposition as named attributes.
+
+    Attributes
+    ----------
+    total_score : float
+        The predicted score for the explained user/item pair, decomposed over
+        the feedback actually used by the explanation.
+    selected_contributions : list
+        The top N ``(itemid, score)`` contributions, sorted by descending
+        score. These are the contributions the explanation highlights.
+    other_contributions : list
+        The remaining participating ``(itemid, score)`` contributions that did
+        not fit into the top N, also sorted by descending score. Together with
+        ``selected_contributions`` these sum to ``total_score``.
+    excluded : list
+        :class:`Exclusion` entries for feedback and target items that do not
+        participate in the decomposition. Each entry records the ``itemid``,
+        the ``confidence`` from the feedback matrix and one of the
+        ``EXCLUDED_*`` reason constants. Negative feedback, zero-contribution
+        feedback and filtered target items are reported separately here.
+    user_factors_source : str
+        Which user factor representation this explanation was requested for:
+        ``"recalculated"`` when ``explain`` was called with
+        ``recalculate_user=True`` (the score is built from factors solved over
+        :attr:`feedback`, and :attr:`stored_user_score` holds the comparable
+        stored-factors score) or ``"stored"`` (the default) otherwise.
+    feedback : csr_matrix
+        The (single-row) feedback matrix that was actually used to build the
+        explanation, after any preprocessing such as the alpha scaling.
+    stored_user_score : float or None
+        The score computed from the model's stored user factors for comparison
+        (``None`` unless ``recalculate_user=True`` was used or the user has no
+        stored factors). Compare this against ``total_score`` to see how much
+        the score changes when the user factors are recalculated from the
+        supplied feedback.
+    user_weights : ndarray
+        A factorized representation of the user (the Cholesky decomposition of
+        the user linear equation). Passing this back in to future ``explain``
+        calls for the same user/feedback speeds them up.
+    """
+
+    __slots__ = ()
+
+    def __new__(
+        cls,
+        total_score,
+        selected_contributions,
+        other_contributions,
+        excluded=None,
+        user_factors_source="stored",
+        feedback=None,
+        stored_user_score=None,
+        user_weights=None,
+    ):
+        return super().__new__(
+            cls,
+            total_score,
+            selected_contributions,
+            other_contributions,
+            list(excluded) if excluded is not None else [],
+            user_factors_source,
+            feedback,
+            stored_user_score,
+            user_weights,
+        )
+
+    @property
+    def top_contributions(self):
+        """Alias for :attr:`selected_contributions`."""
+        return self.selected_contributions
+
+    @property
+    def contributions(self):
+        """All participating contributions (selected and other), in order."""
+        return self.selected_contributions + self.other_contributions
+
+    def excluded_by_reason(self, reason):
+        """Returns the excluded ``Exclusion`` entries matching ``reason``."""
+        return [entry for entry in self.excluded if entry.reason == reason]
+
+    def __iter__(self):
+        # backwards compatibility: explain() used to return
+        # (total_score, top_contributions, user_weights)
+        yield self.total_score
+        yield self.selected_contributions
+        yield self.user_weights
+
+    def __getitem__(self, index):
+        # keep index access consistent with the legacy 3-tuple layout above
+        return (self.total_score, self.selected_contributions, self.user_weights)[index]
 
 
 class RecommenderBase(metaclass=ABCMeta):

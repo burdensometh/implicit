@@ -1,7 +1,6 @@
 """Implicit Alternating Least Squares"""
 
 import functools
-import heapq
 import logging
 import time
 
@@ -10,6 +9,13 @@ import scipy
 import scipy.sparse
 from tqdm.auto import tqdm
 
+from ..recommender_base import (
+    EXCLUDED_FILTERED_TARGET,
+    EXCLUDED_NEGATIVE_FEEDBACK,
+    EXCLUDED_ZERO_CONTRIBUTION,
+    Exclusion,
+    Explanation,
+)
 from ..utils import check_blas_config, check_csr, check_random_state, nonzeros
 from . import _als
 from .matrix_factorization_base import MatrixFactorizationBase
@@ -348,44 +354,115 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
         self._item_norms = None
         self._YtY = None
 
-    def explain(self, userid, user_items, itemid, user_weights=None, N=10):
+    def explain(
+        self,
+        userid,
+        user_items,
+        itemid,
+        user_weights=None,
+        N=10,
+        recalculate_user=False,
+        filter_already_liked_items=True,
+        filter_items=None,
+    ):
         """Provides explanations for why the item is liked by the user.
+
+        The explanation is always tied to the feedback actually used to build
+        it: pass ``recalculate_user=True`` to recompute the user factors from
+        the supplied ``user_items`` row (the same history used by
+        :meth:`recommend` with ``recalculate_user=True``), otherwise the
+        model's stored factors for ``userid`` are used. The resulting
+        :class:`~implicit.recommender_base.Explanation` records which source
+        was used and which feedback matrix it was built from, so re-running
+        with a different history can never be confused with a previous result.
+
+        Every nonzero entry in the user's feedback row is accounted for:
+
+        * positive entries that contribute to the score are split into the
+          top N ``selected_contributions`` and the ``other_contributions``,
+          which together sum to ``total_score``;
+        * negative entries (negative confidence) are reported under
+          ``excluded`` with the ``negative_feedback`` reason and never enter
+          the score;
+        * positive entries whose contribution rounds to zero are reported
+          under ``excluded`` with the ``zero_contribution`` reason;
+        * the explained target itself is reported under ``excluded`` with the
+          ``filtered_target`` reason when it is filtered out of the
+          recommendations (already liked or present in ``filter_items``).
 
         Parameters
         ----------
         userid : int
             The userid to explain recommendations for
         user_items : csr_matrix
-            Sparse matrix containing the liked items for the user
+            Sparse matrix containing the feedback items for the user. Either
+            the full matrix (the row for ``userid`` is selected) or a single
+            row matrix containing feedback for this user.
         itemid : int
             The itemid to explain recommendations for
         user_weights : ndarray, optional
-            Precomputed Cholesky decomposition of the weighted user liked items.
-            Useful for speeding up repeated calls to this function, this value
-            is returned
+            Precomputed Cholesky decomposition of the weighted user feedback
+            items. Useful for speeding up repeated calls, this value is
+            returned on the :class:`~implicit.recommender_base.Explanation`.
         N : int, optional
-            The number of liked items to show the contribution for
+            The number of contributing items to return in
+            ``selected_contributions``
+        recalculate_user : bool, optional
+            When true, also report the score produced by the model's stored
+            user factors for ``userid`` (``stored_user_score``) alongside the
+            feedback-based decomposition, and mark the explanation's
+            ``user_factors_source`` as ``"recalculated"``. The contribution
+            decomposition itself is always derived from a Cholesky solve over
+            the supplied feedback (the same solve :meth:`recalculate_user`
+            uses), so ``total_score`` equals the score
+            :meth:`recommend` returns with ``recalculate_user=True``. With the
+            default false the source is marked ``"stored"`` and
+            ``stored_user_score`` is ``None``.
+        filter_already_liked_items : bool, optional
+            When true (the default) and the explained item is present in the
+            user's feedback, record it as an excluded ``filtered_target``
+            instead of treating it as a normal contributing item.
+        filter_items : array_like, optional
+            List of extra item ids that are filtered out of recommendations.
+            If ``itemid`` is in this list it is likewise recorded as an
+            excluded ``filtered_target``.
 
         Returns
         -------
-        total_score : float
-            The total predicted score for this user/item pair
-        top_contributions : list
-            A list of the top N (itemid, score) contributions for this user/item pair
-        user_weights : ndarray
-            A factorized representation of the user. Passing this in to
-            future 'explain' calls will lead to noticeable speedups
+        Explanation
+            A tuple-like object (backwards compatible with the previous
+            ``(total_score, top_contributions, user_weights)`` return value)
+            containing the total score, selected and remaining contributions,
+            all excluded entries with reasons, the user factors source, the
+            feedback used, the stored-factors score when recalculating and the
+            reusable ``user_weights``.
         """
-
         user_items = check_csr(user_items)
+
+        # resolve the row of feedback that this explanation is built from, and
+        # remember it so the caller can see exactly which history was used
+        row_index = 0 if user_items.shape[0] == 1 else userid
+        feedback = user_items[row_index]
         if self.alpha != 1.0:
-            user_items = self.alpha * user_items
+            feedback = self.alpha * feedback
+
+        filtered_item_ids = set()
+        if filter_items is not None:
+            filtered_item_ids = {int(i) for i in np.asarray(filter_items).ravel()}
+
+        # decide whether the explained target itself would be filtered out of
+        # the recommendations, and therefore must not be scored as a normal
+        # contributing piece of feedback
+        target_confidence = feedback[0, itemid] if itemid < feedback.shape[1] else 0.0
+        target_filtered = itemid in filtered_item_ids or (
+            filter_already_liked_items and target_confidence != 0.0
+        )
 
         # user_weights = Cholesky decomposition of Wu^-1
         # from section 5 of the paper CF for Implicit Feedback Datasets
         if user_weights is None:
             A, _ = user_linear_equation(
-                self.item_factors, self.YtY, user_items, userid, self.regularization, self.factors
+                self.item_factors, self.YtY, feedback, 0, self.regularization, self.factors
             )
             user_weights = scipy.linalg.cho_factor(A)
         seed_item = self.item_factors[itemid]
@@ -393,27 +470,93 @@ class AlternatingLeastSquares(MatrixFactorizationBase):
         # weighted_item = y_i^t W_u
         weighted_item = scipy.linalg.cho_solve(user_weights, seed_item)
 
-        total_score = 0.0
-        h = []
-        h_len = 0
-        for other_itemid, confidence in nonzeros(user_items, userid):
-            if confidence < 0:
+        if recalculate_user:
+            user_factors_source = "recalculated"
+            # stored factors may not exist for a user that is only known
+            # through the passed in feedback, in which case there is no stored
+            # score to compare against
+            stored_user_score = (
+                float(self.user_factors[userid].dot(seed_item))
+                if userid < self.user_factors.shape[0]
+                else None
+            )
+        else:
+            user_factors_source = "stored"
+            stored_user_score = None
+
+        decomposed_score = 0.0
+        contributions = []
+        excluded = []
+
+        if target_filtered:
+            excluded.append(
+                Exclusion(
+                    itemid=itemid,
+                    confidence=float(target_confidence),
+                    reason=EXCLUDED_FILTERED_TARGET,
+                )
+            )
+
+        for other_itemid, confidence in nonzeros(feedback, 0):
+            # the target is accounted for above when it is filtered
+            if other_itemid == itemid and target_filtered:
                 continue
 
             factor = self.item_factors[other_itemid]
-            # s_u^ij = (y_i^t W^u) y_j
-            score = weighted_item.dot(factor) * confidence
-            total_score += score
-            contribution = (score, other_itemid)
-            if h_len < N:
-                heapq.heappush(h, contribution)
-                h_len += 1
-            else:
-                heapq.heappushpop(h, contribution)
 
-        items = (heapq.heappop(h) for i in range(len(h)))
-        top_contributions = list((i, s) for s, i in items)[::-1]
-        return total_score, top_contributions, user_weights
+            if confidence < 0:
+                # negative feedback shapes the user factors through the
+                # Cholesky solve but must never contribute a score term
+                excluded.append(
+                    Exclusion(
+                        itemid=other_itemid,
+                        confidence=float(confidence),
+                        reason=EXCLUDED_NEGATIVE_FEEDBACK,
+                    )
+                )
+                continue
+
+            # s_u^ij = (y_i^t W^u) y_j * c_uj
+            score = float(weighted_item.dot(factor) * confidence)
+
+            if score == 0.0:
+                excluded.append(
+                    Exclusion(
+                        itemid=other_itemid,
+                        confidence=float(confidence),
+                        reason=EXCLUDED_ZERO_CONTRIBUTION,
+                    )
+                )
+                continue
+
+            decomposed_score += score
+            contributions.append((other_itemid, score))
+
+        # rank all participating contributions once, then split into the
+        # selected top N and the rest instead of silently truncating
+        contributions.sort(key=lambda pair: pair[1], reverse=True)
+        selected_contributions = [
+            (item_id, score) for item_id, score in contributions[:N]
+        ]
+        other_contributions = [
+            (item_id, score) for item_id, score in contributions[N:]
+        ]
+
+        # the per-feedback terms partition the full predicted score: this sum
+        # equals the recalculated user factor dot the seed item factor, i.e.
+        # the score recommend(..., recalculate_user=True) produces
+        total_score = decomposed_score
+
+        return Explanation(
+            total_score=total_score,
+            selected_contributions=selected_contributions,
+            other_contributions=other_contributions,
+            excluded=excluded,
+            user_factors_source=user_factors_source,
+            feedback=feedback,
+            stored_user_score=stored_user_score,
+            user_weights=user_weights,
+        )
 
     @property
     def solver(self):

@@ -229,7 +229,10 @@ def test_explain():
 
     # Assert explanation makes sense
     top_rec, score = recalculated_ids[0], recalculated_scores[0]
-    score_explained, contributions, W = model.explain(userid, user_items, itemid=top_rec)
+    explanation = model.explain(userid, user_items, itemid=top_rec, recalculate_user=True)
+
+    # backwards compatible tuple access: (total_score, top_contributions, user_weights)
+    score_explained, contributions, W = explanation
     scores = [s for _, s in contributions]
     items = [i for i, _ in contributions]
     assert pytest.approx(score, abs=1e-4) == score_explained
@@ -239,17 +242,208 @@ def test_explain():
     assert scores == sorted(scores, reverse=True), "Scores not in order"
     assert [0, 2, 3, 4] == sorted(items), "Items not seen by user"
 
-    # Assert explanation with precomputed user weights is correct
-    top_score_explained, top_contributions, W = model.explain(
-        userid, user_items, itemid=top_rec, user_weights=W, N=2
+    # the explanation records the user factors source and the feedback used,
+    # so callers can tie it back to the exact history that built the score
+    assert explanation.user_factors_source == "recalculated"
+    assert explanation.feedback.nnz == user_items[userid].nnz
+    assert explanation.stored_user_score == pytest.approx(
+        model.user_factors[userid].dot(model.item_factors[top_rec]), abs=1e-6
     )
-    top_scores = [s for _, s in top_contributions]
-    top_items = [i for i, _ in top_contributions]
+    # the top recommendation wasn't filtered, so nothing is excluded here
+    assert explanation.excluded == []
+    assert explanation.other_contributions == []
 
-    assert len(top_contributions) == 2
-    assert pytest.approx(score, abs=1e-4) == top_score_explained
+    # Assert explanation with precomputed user weights is correct
+    top_explanation = model.explain(
+        userid, user_items, itemid=top_rec, user_weights=W, N=2, recalculate_user=True
+    )
+    top_scores = [s for _, s in top_explanation.selected_contributions]
+    top_items = [i for i, _ in top_explanation.selected_contributions]
+
+    assert len(top_explanation.selected_contributions) == 2
+    assert pytest.approx(score, abs=1e-4) == top_explanation.total_score
     assert scores[:2] == top_scores
     assert items[:2] == top_items
+
+    # truncated contributions are preserved instead of being dropped: the
+    # selected and remaining contributions still partition the total score
+    assert len(top_explanation.other_contributions) == 2
+    all_contributions = (
+        top_explanation.selected_contributions + top_explanation.other_contributions
+    )
+    assert [i for i, _ in all_contributions] == items
+    assert sum(s for _, s in all_contributions) == pytest.approx(
+        top_explanation.total_score, abs=1e-6
+    )
+
+
+def test_explain_user_factors_source():
+    user_items = get_checker_board(10)
+    model = AlternatingLeastSquares(
+        factors=2, regularization=0.1, use_gpu=False, random_state=23
+    )
+    model.fit(user_items, show_progress=False)
+    userid = 0
+    itemid = int(model.recommend(userid, user_items[userid], N=1)[0][0])
+
+    stored = model.explain(userid, user_items, itemid=itemid)
+    assert stored.user_factors_source == "stored"
+    assert stored.stored_user_score is None
+    assert stored.feedback.nnz == user_items[userid].nnz
+
+    recalculated = model.explain(
+        userid, user_items, itemid=itemid, recalculate_user=True
+    )
+    assert recalculated.user_factors_source == "recalculated"
+    # the recalculated explanation score matches the recalculated recommend score
+    _, recalc_scores = model.recommend(
+        userid, user_items[userid], N=1, recalculate_user=True
+    )
+    assert recalculated.total_score == pytest.approx(recalc_scores[0], abs=1e-5)
+    # the stored factors score is exposed for comparison
+    assert recalculated.stored_user_score == pytest.approx(
+        model.user_factors[userid].dot(model.item_factors[itemid]), abs=1e-6
+    )
+
+    # a userid beyond the stored factors has no stored score to compare with,
+    # but the feedback-based explanation still works without raising
+    unknown_userid = user_items.shape[0] + 5
+    unknown = model.explain(
+        unknown_userid, user_items[userid], itemid=itemid, recalculate_user=True
+    )
+    assert unknown.stored_user_score is None
+    assert unknown.user_factors_source == "recalculated"
+    assert unknown.total_score == pytest.approx(recalculated.total_score, abs=1e-6)
+
+
+def test_explain_tied_to_feedback_used():
+    # re-running explain with a different history must produce an explanation
+    # bound to that new history rather than reusing stale feedback
+    user_items = get_checker_board(10)
+    model = AlternatingLeastSquares(
+        factors=2, regularization=0.1, use_gpu=False, random_state=23
+    )
+    model.fit(user_items, show_progress=False)
+    userid = 0
+    itemid = int(model.recommend(userid, user_items[userid], N=1)[0][0])
+
+    original = model.explain(
+        userid, user_items, itemid=itemid, recalculate_user=True
+    )
+    contributed_items = {i for i, _ in original.contributions}
+    assert contributed_items
+
+    dropped = next(iter(contributed_items))
+    modified = user_items.tolil()
+    modified[userid, dropped] = 0
+    modified = modified.tocsr()
+
+    reexplained = model.explain(
+        userid, modified, itemid=itemid, recalculate_user=True
+    )
+    assert reexplained.feedback.nnz == original.feedback.nnz - 1
+    assert dropped not in {i for i, _ in reexplained.contributions}
+    assert reexplained.total_score != original.total_score
+
+    # a single-row feedback matrix is accepted and gives the same result
+    row_explanation = model.explain(
+        userid, user_items[userid], itemid=itemid, recalculate_user=True
+    )
+    assert row_explanation.total_score == pytest.approx(
+        original.total_score, abs=1e-6
+    )
+
+
+def test_explain_exclusions():
+    from implicit.recommender_base import (
+        EXCLUDED_FILTERED_TARGET,
+        EXCLUDED_NEGATIVE_FEEDBACK,
+        EXCLUDED_ZERO_CONTRIBUTION,
+    )
+
+    user_items = get_checker_board(10)
+    model = AlternatingLeastSquares(
+        factors=4, regularization=1.0, use_gpu=False, random_state=23
+    )
+    model.fit(user_items, show_progress=False)
+    userid = 0
+    itemid = int(model.recommend(userid, user_items[userid], N=1)[0][0])
+
+    # negative feedback is excluded with a distinct reason and never scored
+    with_negative = user_items.tolil()
+    negative_itemid = user_items.shape[1] - 1
+    with_negative[userid, negative_itemid] = -2.0
+    with_negative = with_negative.tocsr()
+    explanation = model.explain(
+        userid, with_negative, itemid=itemid, recalculate_user=True
+    )
+    negative_entries = explanation.excluded_by_reason(EXCLUDED_NEGATIVE_FEEDBACK)
+    assert len(negative_entries) == 1
+    assert negative_entries[0].itemid == negative_itemid
+    assert negative_entries[0].confidence < 0
+    assert negative_itemid not in {i for i, _ in explanation.contributions}
+    # negative feedback still shaped the factors, so the score changes
+    baseline = model.explain(
+        userid, user_items, itemid=itemid, recalculate_user=True
+    )
+    assert explanation.total_score != baseline.total_score
+
+    # a liked target is a filtered target by default, with its reason preserved
+    liked_itemid = int(user_items[userid].indices[0])
+    liked_explanation = model.explain(
+        userid, user_items, itemid=liked_itemid, recalculate_user=True
+    )
+    filtered = liked_explanation.excluded_by_reason(EXCLUDED_FILTERED_TARGET)
+    assert len(filtered) == 1
+    assert filtered[0].itemid == liked_itemid
+    assert liked_itemid not in {i for i, _ in liked_explanation.contributions}
+
+    # filter_items marks the target filtered even when it wasn't liked
+    forced_filter = model.explain(
+        userid,
+        user_items,
+        itemid=itemid,
+        filter_items=[itemid],
+        recalculate_user=True,
+    )
+    assert any(
+        entry.itemid == itemid and entry.reason == EXCLUDED_FILTERED_TARGET
+        for entry in forced_filter.excluded
+    )
+
+    # disabling filtering lets the liked target participate in the score
+    unfiltered = model.explain(
+        userid,
+        user_items,
+        itemid=liked_itemid,
+        filter_already_liked_items=False,
+        recalculate_user=True,
+    )
+    assert unfiltered.excluded_by_reason(EXCLUDED_FILTERED_TARGET) == []
+    assert liked_itemid in {i for i, _ in unfiltered.contributions}
+
+    # zero contribution feedback is reported separately from negative feedback
+    model.item_factors[liked_itemid] = 0.0
+    zero_explanation = model.explain(
+        userid,
+        user_items,
+        itemid=itemid,
+        filter_already_liked_items=False,
+        recalculate_user=True,
+    )
+    zero_entries = zero_explanation.excluded_by_reason(EXCLUDED_ZERO_CONTRIBUTION)
+    assert any(entry.itemid == liked_itemid for entry in zero_entries)
+    assert all(
+        entry.reason != EXCLUDED_NEGATIVE_FEEDBACK for entry in zero_entries
+    )
+    assert liked_itemid not in {i for i, _ in zero_explanation.contributions}
+    # the three exclusion reasons are mutually distinguishable on every entry
+    reasons = {entry.reason for entry in zero_explanation.excluded}
+    assert reasons <= {
+        EXCLUDED_NEGATIVE_FEEDBACK,
+        EXCLUDED_ZERO_CONTRIBUTION,
+        EXCLUDED_FILTERED_TARGET,
+    }
 
 
 @pytest.mark.parametrize("use_gpu", [True, False] if HAS_CUDA else [False])
